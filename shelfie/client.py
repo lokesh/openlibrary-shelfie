@@ -14,11 +14,22 @@ import requests
 
 
 class OLError(Exception):
+    # Some OL responses dump multi-page HTML stack traces on 5xx. Truncate
+    # so the terminal doesn't get flooded — full body stays on `self.text`
+    # for callers that need it.
+    MAX_BODY = 300
+
     def __init__(self, e):
         self.code = e.response.status_code
         self.headers = e.response.headers
         self.text = e.response.text
-        Exception.__init__(self, f"{e}. Response: {self.text}")
+        body = " ".join((self.text or "").split())
+        if len(body) > self.MAX_BODY:
+            body = body[: self.MAX_BODY] + "…"
+        msg = f"HTTP {self.code}"
+        if body:
+            msg = f"{msg}: {body}"
+        Exception.__init__(self, msg)
 
 
 class OLClient:

@@ -8,15 +8,17 @@ Shelfie is a sidecar CLI that joins a running Open Library Docker stack and popu
 
 ## Common commands
 
-Local dev (no OL stack needed for unit tests — they mock network/infobase):
+Local dev (no OL stack needed for unit tests — they mock network/infobase). Requires Python 3.12+ (`pyproject.toml`):
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest                                    # full test suite
 .venv/bin/pytest tests/test_shelfie.py::TestIsLowQuality -v   # single class
 .venv/bin/pytest -k merge_save                      # single test by name
 ```
+
+Two entry points reach `cli.main()`: `python -m shelfie` (via `shelfie/__main__.py`) and the installed `shelfie` console script (defined in `pyproject.toml`). The Docker image uses the former.
 
 Against a running OL stack (in the OL clone, `docker compose up` first):
 
@@ -64,3 +66,7 @@ All styled output, prompts, spinners, and progress bars live in `shelfie/ui.py` 
 ## After editing `cli.py`
 
 Run `cmd_smoke_test` (`docker compose run --rm shelfie smoke-test`) against a fresh dev DB. It's a regression battery for the specific bugs PR #12157 review caught, not a generic test — each check is named with the bug number it guards.
+
+## When the stack looks broken
+
+`health-check` is the canonical first diagnostic — it pings `web`/`infobase`/`solr` as discrete steps and verifies login, so failures isolate cleanly. Point users there before debugging ad-hoc.

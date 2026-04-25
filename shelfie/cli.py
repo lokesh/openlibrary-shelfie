@@ -91,10 +91,12 @@ from .ui import (
     dim,
     error,
     failure_logger,
+    friendly_error,
     header,
     import_progress,
     info,
     plain,
+    report_error,
     spinner,
     stats_table,
     step_progress,
@@ -129,6 +131,30 @@ def load_json(filename):
         return json.load(f)
 
 
+def _preflight_docker_check(url):
+    """Fail fast if the user is trying to use Docker hostnames outside Docker.
+
+    The defaults (web:8080, infobase:7000, solr:8983) only resolve inside the
+    OL Docker network. Without this guard, a beginner running `python -m
+    shelfie` from a venv hits a wall of cryptic DNS errors. This catches the
+    common case before anything else touches the network.
+    """
+    if url != DEFAULT_BASE_URL:
+        return  # User has overridden the URL — assume they know what they're doing.
+    if Path("/.dockerenv").exists():
+        return
+    error("Looks like you're running shelfie outside the OL Docker stack.")
+    plain("")
+    plain("Shelfie's defaults (web:8080, infobase:7000, solr:8983) are Docker")
+    plain("hostnames and only resolve inside OL's Docker network.")
+    plain("")
+    plain("From your OL clone, run:")
+    console.print("  [bold cyan]docker compose run --rm shelfie[/bold cyan]")
+    plain("")
+    dim("Or pass --url to point shelfie at a host you've made reachable some other way.")
+    raise SystemExit(1)
+
+
 def connect(base_url=None, email=None, password=None):
     """Create and authenticate an OL client."""
     base_url = base_url or DEFAULT_BASE_URL
@@ -138,13 +164,25 @@ def connect(base_url=None, email=None, password=None):
     try:
         with spinner(f"Logging in as {email}…"):
             ol.login(email, password)
-        if ol.cookie:
-            success(f"Logged in as [cyan]{email}[/cyan]")
-        else:
-            warn(f"Login returned no session cookie for [cyan]{email}[/cyan]")
-            dim("  Some features (imports, role changes) may not work.")
     except (OLError, requests.RequestException) as e:
-        warn(f"Login failed ({e}). Continuing without auth.")
+        report_error(e, target_url=base_url, operation="Login failed")
+        dim("  Run 'shelfie health-check' to see which service is unreachable.")
+        return ol
+
+    if ol.cookie:
+        success(f"Logged in as [cyan]{email}[/cyan]")
+        return ol
+
+    # Login endpoint returns 200 even on bad credentials — it just doesn't
+    # set a session cookie. Tell the user what likely went wrong.
+    error("Login was rejected — no session cookie returned.")
+    if email != DEFAULT_LOGIN_EMAIL:
+        dim(f"  You used: {email}")
+        dim(f"  Default dev login is {DEFAULT_LOGIN_EMAIL} / {DEFAULT_LOGIN_PASSWORD}.")
+    else:
+        dim(f"  Default dev login ({DEFAULT_LOGIN_EMAIL} / {DEFAULT_LOGIN_PASSWORD}) was rejected.")
+        dim("  Was the dev DB initialized? OL's bootstrap usually creates this user.")
+    dim("  Most operations will fail without auth. Run 'shelfie health-check' to diagnose.")
     return ol
 
 
@@ -1379,6 +1417,7 @@ def cmd_seed_series(ol, count=3):
             params={"query": json.dumps({"type": "/type/series", "limit": 10000})},
             timeout=10,
         )
+        resp.raise_for_status()
         existing = resp.json()
         max_id = 0
         for key in existing:
@@ -1437,11 +1476,15 @@ def cmd_seed_series(ol, count=3):
             }
             for pos, wk in enumerate(imported_work_keys)
         ]
-        with contextlib.suppress(requests.RequestException):
+        try:
             _merge_save(
                 work_patches,
                 comment=f"shelfie: linking works to series '{series_name}'",
             )
+        except requests.RequestException as e:
+            error(f"Linking works to '[cyan]{series_name}[/cyan]': {e}")
+            warn(f"Series [cyan]{series_key}[/cyan] was created but is not linked to its works.")
+            continue
 
         success(
             f"Created [cyan]{series_name}[/cyan] [dim]({series_key})[/dim] with {len(imported_work_keys)} works"
@@ -1637,7 +1680,8 @@ def cmd_health_check(url=None, email=None, password=None):
         try:
             resp = requests.get(target_url, timeout=5, allow_redirects=False)
         except requests.RequestException as e:
-            return False, str(e)
+            headline, _ = friendly_error(e, target_url)
+            return False, headline
         # Any HTTP response means the server is up. 4xx/5xx still proves
         # the port is open and a service is answering.
         return True, f"HTTP {resp.status_code}"
@@ -1656,12 +1700,20 @@ def cmd_health_check(url=None, email=None, password=None):
         ol.login(email, password)
         _check(f"login as {email}", bool(ol.cookie), "no session cookie returned")
     except (OLError, requests.RequestException) as e:
-        _check(f"login as {email}", False, str(e))
+        headline, _ = friendly_error(e, url)
+        _check(f"login as {email}", False, headline)
 
     console.print()
     if failures:
         error(f"[bold]{len(failures)}[/bold] check(s) failed.")
-        dim("  See README troubleshooting for network-name and login defaults.")
+        if not Path("/.dockerenv").exists() and url == DEFAULT_BASE_URL:
+            plain("")
+            plain("Looks like you're running outside the OL Docker stack.")
+            plain("Shelfie's defaults are Docker hostnames; they only resolve inside")
+            plain("OL's network. From your OL clone, run:")
+            console.print("  [bold cyan]docker compose run --rm shelfie health-check[/bold cyan]")
+        else:
+            dim("  See README troubleshooting for network-name and login defaults.")
         return 1
     success("Stack is healthy.")
     return 0
@@ -2011,14 +2063,18 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # health-check runs its own login as a measured step — skip auto-connect.
+    # We also skip the Docker preflight here: health-check is the right tool
+    # to *diagnose* exactly the situation the preflight catches.
+    if args.command == "health-check":
+        raise SystemExit(cmd_health_check(args.url, args.email, args.password))
+
+    _preflight_docker_check(args.url)
+
     # No subcommand = interactive mode
     if not args.command:
         interactive_menu()
         return
-
-    # health-check runs its own login as a measured step — skip auto-connect.
-    if args.command == "health-check":
-        raise SystemExit(cmd_health_check(args.url, args.email, args.password))
 
     ol = connect(args.url, args.email, args.password)
 

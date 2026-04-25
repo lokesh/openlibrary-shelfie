@@ -5,6 +5,7 @@ stays focused on the OL-specific logic.
 """
 
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 import questionary
 from questionary import Style as QStyle
@@ -184,6 +185,160 @@ def plain(msg):
 
 
 # ---------------------------------------------------------------------------
+# Friendly error reporting
+# ---------------------------------------------------------------------------
+#
+# Most users hitting an error in shelfie will be early-stage developers
+# setting up a local Open Library stack for the first time. Raw `requests`
+# exceptions ("HTTPConnectionPool ... NameResolutionError") aren't readable
+# at that level. friendly_error() inspects the exception and returns a
+# plain-English headline plus actionable hints; report_error() prints them.
+
+# Hostnames that only exist inside the OL Docker network. If we see a DNS
+# failure on one of these, the user is almost certainly running outside the
+# stack and needs the docker-compose command, not a network-debugging rabbit
+# hole.
+DOCKER_HOSTNAMES = {"web", "infobase", "solr"}
+
+
+def _parse_host_port(url):
+    if not url:
+        return None, None
+    try:
+        parsed = urlparse(url if "://" in url else "http://" + url)
+        return parsed.hostname, parsed.port
+    except (ValueError, AttributeError):
+        return None, None
+
+
+def _truncate(text, n=200):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def friendly_error(exc, target_url=None):
+    """Translate a network/HTTP exception into (headline, hints).
+
+    headline is a single short sentence; hints is a list of follow-up lines
+    suggesting what to try. Designed for early-stage developers — prefers
+    plain language and concrete next steps over technical accuracy.
+    """
+    host, port = _parse_host_port(target_url)
+    label = host or "the server"
+    msg = str(exc)
+    msg_lower = msg.lower()
+
+    # HTTP status codes — works for both our OLError (`.code`) and
+    # requests.HTTPError (`.response.status_code`).
+    code = getattr(exc, "code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if code:
+        return _http_status_message(code, host, exc)
+
+    # DNS — multiple message shapes across platforms and urllib3 versions.
+    dns_markers = (
+        "name or service not known",
+        "nameresolutionerror",
+        "nodename nor servname",
+        "temporary failure in name resolution",
+        "failed to resolve",
+        "getaddrinfo failed",
+    )
+    if any(m in msg_lower for m in dns_markers):
+        return _dns_message(host)
+
+    if "connection refused" in msg_lower:
+        return _refused_message(host, port)
+
+    if "timed out" in msg_lower or "timeout" in msg_lower:
+        return _timeout_message(host)
+
+    if "connection" in msg_lower and "reset" in msg_lower:
+        return (
+            f"Connection to {label} was reset.",
+            ["The service may be restarting. Wait a moment and try again."],
+        )
+
+    return (f"{type(exc).__name__} talking to {label}.", [_truncate(msg)])
+
+
+def _dns_message(host):
+    if host in DOCKER_HOSTNAMES:
+        return (
+            f"Can't resolve '{host}' — looks like you're not inside the OL Docker stack.",
+            [
+                "Shelfie's defaults are Docker hostnames; they only resolve inside OL's network.",
+                "From your OL clone, run:  docker compose run --rm shelfie",
+                "Or pass --url to point at a different host.",
+            ],
+        )
+    label = f"'{host}'" if host else "the hostname"
+    return (
+        f"Can't resolve {label}.",
+        ["Check your network connection or the URL you're using."],
+    )
+
+
+def _refused_message(host, port):
+    label = f"{host}:{port}" if host and port else (host or "the server")
+    if host in DOCKER_HOSTNAMES:
+        return (
+            f"{label} refused the connection — the service isn't running.",
+            [
+                "From your OL clone, see what's up:  docker compose ps",
+                "Start the stack if needed:  docker compose up -d",
+            ],
+        )
+    return (f"{label} refused the connection.", ["Is the service running on that port?"])
+
+
+def _timeout_message(host):
+    label = host or "the server"
+    if host in DOCKER_HOSTNAMES:
+        return (
+            f"{label} timed out.",
+            [
+                "It may still be starting up — wait ~30s and try again.",
+                f"Check progress:  docker compose logs {host}",
+            ],
+        )
+    return (f"{label} timed out.", ["Try again, or check your network."])
+
+
+def _http_status_message(code, host, exc):
+    label = host or "the server"
+    if code in (401, 403):
+        return (
+            f"Authentication rejected ({code}).",
+            [
+                "Default dev credentials: openlibrary@example.com / admin123",
+                "Override with --email and --password.",
+            ],
+        )
+    if code == 404:
+        return (f"Not found (404) on {label}.", ["The endpoint or resource doesn't exist."])
+    if 500 <= code < 600:
+        hints = []
+        if host in DOCKER_HOSTNAMES:
+            hints.append(f"Check service logs:  docker compose logs {host}")
+        body = _truncate(getattr(exc, "text", "") or "")
+        if body:
+            hints.append(f"Server said: {body}")
+        return (f"{label} returned {code} (server error).", hints)
+    return (f"HTTP {code} from {label}.", [_truncate(str(exc))])
+
+
+def report_error(exc, target_url=None, operation=None):
+    """Print a friendly error message with hints for what to try next."""
+    headline, hints = friendly_error(exc, target_url)
+    prefix = f"{operation}: " if operation else ""
+    error(prefix + headline)
+    for hint in hints:
+        dim(f"  {hint}")
+
+
+# ---------------------------------------------------------------------------
 # Long-running operations
 # ---------------------------------------------------------------------------
 
@@ -260,6 +415,8 @@ __all__ = [
     "error",
     "dim",
     "plain",
+    "friendly_error",
+    "report_error",
     "spinner",
     "import_progress",
     "step_progress",

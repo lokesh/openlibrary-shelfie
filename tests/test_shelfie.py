@@ -14,8 +14,11 @@ from shelfie.cli import (
     _merge_save,
     _pick_publisher,
     _search_doc_to_record,
+    cmd_add_books,
     cmd_list_users,
     cmd_populate_covers,
+    cmd_seed_series,
+    cmd_set_role,
 )
 
 
@@ -374,3 +377,299 @@ class TestCmdListUsers:
         with patch("shelfie.cli._infobase_keys_of_type", return_value=[]):
             cmd_list_users(ol=MagicMock())
         assert "No users found." in capsys.readouterr().out
+
+
+def _max_id_response(keys):
+    """Build the response object cmd_seed_series uses to discover existing series keys."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = keys
+    return resp
+
+
+class TestCmdSeedSeries:
+    def _series_works(self, n):
+        """Generate n minimal search docs that pass the >= 2-works threshold."""
+        return [{"key": f"/works/W{i}", "title": f"Title {i}"} for i in range(n)]
+
+    def test_creates_series_and_links_works(self, capsys):
+        works = self._series_works(3)
+        imported_keys = ["/works/OL10W", "/works/OL11W", "/works/OL12W"]
+
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response([])),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=imported_keys * 5),
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save") as mock_merge,
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        # Series doc went through infobase_save (full new doc, not a partial).
+        assert mock_infobase.call_count == 1
+        (series_docs,) = mock_infobase.call_args[0]
+        assert len(series_docs) == 1
+        series_doc = series_docs[0]
+        assert series_doc["type"] == {"key": "/type/series"}
+        # Empty existing -> max_id stays 0, first key is OL1L.
+        assert series_doc["key"] == "/series/OL1L"
+
+        # Work-to-series links went through _merge_save (partial patch).
+        assert mock_merge.call_count == 1
+        (patches,) = mock_merge.call_args[0]
+        assert [p["key"] for p in patches] == imported_keys
+        assert all(p["series"][0]["series"]["key"] == "/series/OL1L" for p in patches)
+
+        assert "1/1" in capsys.readouterr().out
+
+    def test_max_id_advances_past_existing_series(self):
+        existing = ["/series/OL3L", "/series/OL7L", "/series/OL5L", "/garbage/OLxL"]
+        works = self._series_works(2)
+
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response(existing)),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", "/works/OL2W"]),
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save"),
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        # max_id = 7, succeeded = 0, so first new key is /series/OL8L.
+        assert mock_infobase.call_args[0][0][0]["key"] == "/series/OL8L"
+
+    def test_falls_back_to_safe_offset_when_infobase_unreachable(self):
+        works = self._series_works(2)
+
+        with (
+            patch("shelfie.cli.requests.get", side_effect=requests.RequestException("infobase down")),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", "/works/OL2W"]),
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save"),
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        # Fetch failure -> max_id = 100 safety buffer, so first new key is /series/OL101L.
+        assert mock_infobase.call_args[0][0][0]["key"] == "/series/OL101L"
+
+    def test_falls_back_to_safe_offset_on_http_error(self):
+        """A 5xx from infobase must take the same path as a network error -
+        regression for the missing raise_for_status() that let JSON-shaped
+        error bodies through."""
+        bad_resp = MagicMock()
+        bad_resp.raise_for_status.side_effect = requests.HTTPError("500")
+
+        works = self._series_works(2)
+        with (
+            patch("shelfie.cli.requests.get", return_value=bad_resp),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", "/works/OL2W"]),
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save"),
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        assert mock_infobase.call_args[0][0][0]["key"] == "/series/OL101L"
+
+    def test_skips_series_when_too_few_works_found(self, capsys):
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response([])),
+            patch("shelfie.cli._fetch_series_works", return_value=self._series_works(1)),
+            patch("shelfie.cli._import_and_get_work_key") as mock_import,
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save") as mock_merge,
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        mock_import.assert_not_called()
+        mock_infobase.assert_not_called()
+        mock_merge.assert_not_called()
+        assert "0/1" in capsys.readouterr().out
+
+    def test_skips_series_when_too_few_works_imported(self, capsys):
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response([])),
+            patch("shelfie.cli._fetch_series_works", return_value=self._series_works(3)),
+            # Only one of three imports succeeds.
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", None, None]),
+            patch("shelfie.cli.infobase_save") as mock_infobase,
+            patch("shelfie.cli._merge_save") as mock_merge,
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        mock_infobase.assert_not_called()
+        mock_merge.assert_not_called()
+        assert "0/1" in capsys.readouterr().out
+
+    def test_link_failure_reports_error_and_does_not_count_as_success(self, capsys):
+        """Regression: a series whose work-links fail must not be reported as
+        successful, and must surface an error so the user knows the series doc
+        is orphaned. Previously this was silently swallowed by contextlib.suppress."""
+        works = self._series_works(2)
+
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response([])),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", "/works/OL2W"]),
+            patch("shelfie.cli.infobase_save"),
+            patch("shelfie.cli._merge_save", side_effect=requests.RequestException("infobase 500")),
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        out = capsys.readouterr().out
+        # Error is surfaced and the orphan series key is named.
+        assert "Linking works" in out
+        assert "/series/OL1L" in out
+        # Final tally must NOT count this as a success.
+        assert "0/1" in out
+
+    def test_series_creation_failure_skips_to_next(self, capsys):
+        works = self._series_works(2)
+
+        with (
+            patch("shelfie.cli.requests.get", return_value=_max_id_response([])),
+            patch("shelfie.cli._fetch_series_works", return_value=works),
+            patch("shelfie.cli._import_and_get_work_key", side_effect=["/works/OL1W", "/works/OL2W"]),
+            patch("shelfie.cli.infobase_save", side_effect=requests.RequestException("boom")),
+            patch("shelfie.cli._merge_save") as mock_merge,
+        ):
+            cmd_seed_series(ol=MagicMock(), count=1)
+
+        # If the series doc itself can't be saved, don't attempt to link works to a non-existent key.
+        mock_merge.assert_not_called()
+        assert "0/1" in capsys.readouterr().out
+
+
+class TestCmdAddBooks:
+    def test_production_source_imports_fetched_records(self):
+        records = [{"title": "A", "authors": [{"name": "X"}], "source_records": ["s:1"]}]
+
+        with (
+            patch("shelfie.cli._fetch_books_from_prod", return_value=records),
+            patch("shelfie.cli._import_books", return_value=(1, 0)) as mock_import,
+        ):
+            n = cmd_add_books(ol=MagicMock(), count=1, source="production")
+
+        assert n == 1
+        passed_records = mock_import.call_args[0][1]
+        assert passed_records == records
+
+    def test_falls_back_to_seed_when_prod_unreachable(self, capsys):
+        with (
+            patch("shelfie.cli._fetch_books_from_prod", return_value=[]),
+            patch("shelfie.cli._import_books", return_value=(2, 0)) as mock_import,
+        ):
+            cmd_add_books(ol=MagicMock(), count=2, source="production")
+
+        # Imported from seed_data/books.json on fallback.
+        assert mock_import.call_count == 1
+        records = mock_import.call_args[0][1]
+        assert len(records) == 2
+        assert all(r["source_records"][0].startswith("shelfie:seed-") for r in records)
+        assert "Falling back to seed data" in capsys.readouterr().out
+
+    def test_explicit_seed_source_does_not_hit_network(self):
+        with (
+            patch("shelfie.cli._fetch_books_from_prod") as mock_fetch,
+            patch("shelfie.cli._import_books", return_value=(3, 0)) as mock_import,
+        ):
+            cmd_add_books(ol=MagicMock(), count=3, source="seed")
+
+        mock_fetch.assert_not_called()
+        records = mock_import.call_args[0][1]
+        assert len(records) == 3
+
+
+class TestCmdSetRole:
+    def _ol_with(self, user_doc=None, group_doc=None, missing=()):
+        """Build an OLClient mock that returns user/group docs from .get(key)."""
+        ol = MagicMock()
+        docs = {}
+        if user_doc is not None:
+            docs[user_doc["key"]] = user_doc
+        if group_doc is not None:
+            docs[group_doc["key"]] = group_doc
+
+        def get(key, v=None):
+            if key in missing:
+                from shelfie.client import OLError
+                err = MagicMock()
+                err.response.status_code = 404
+                err.response.headers = {}
+                err.response.text = "not found"
+                raise OLError(err)
+            return docs.get(key, {})
+
+        ol.get.side_effect = get
+        return ol
+
+    def test_add_user_to_group_writes_full_doc(self):
+        user = {"key": "/people/alice", "displayname": "Alice"}
+        group = {"key": "/usergroup/admin", "type": {"key": "/type/usergroup"}, "members": []}
+        ol = self._ol_with(user_doc=user, group_doc=group)
+
+        with patch("shelfie.cli.infobase_save") as mock_save:
+            cmd_set_role(ol, username="alice", role="admin", action="add")
+
+        (docs,) = mock_save.call_args[0]
+        assert len(docs) == 1
+        saved = docs[0]
+        # Full doc replacement is correct here - usergroups have no other fields shelfie cares about.
+        assert saved["key"] == "/usergroup/admin"
+        assert saved["type"] == {"key": "/type/usergroup"}
+        assert saved["members"] == [{"key": "/people/alice"}]
+
+    def test_remove_user_from_group(self):
+        user = {"key": "/people/alice", "displayname": "Alice"}
+        group = {
+            "key": "/usergroup/admin",
+            "type": {"key": "/type/usergroup"},
+            "members": [{"key": "/people/alice"}, {"key": "/people/bob"}],
+        }
+        ol = self._ol_with(user_doc=user, group_doc=group)
+
+        with patch("shelfie.cli.infobase_save") as mock_save:
+            cmd_set_role(ol, username="alice", role="admin", action="remove")
+
+        saved = mock_save.call_args[0][0][0]
+        assert saved["members"] == [{"key": "/people/bob"}]
+
+    def test_noop_when_already_member(self, capsys):
+        user = {"key": "/people/alice"}
+        group = {
+            "key": "/usergroup/admin",
+            "type": {"key": "/type/usergroup"},
+            "members": [{"key": "/people/alice"}],
+        }
+        ol = self._ol_with(user_doc=user, group_doc=group)
+
+        with patch("shelfie.cli.infobase_save") as mock_save:
+            cmd_set_role(ol, username="alice", role="admin", action="add")
+
+        mock_save.assert_not_called()
+        assert "already in" in capsys.readouterr().out
+
+    def test_noop_when_removing_non_member(self, capsys):
+        user = {"key": "/people/alice"}
+        group = {
+            "key": "/usergroup/admin",
+            "type": {"key": "/type/usergroup"},
+            "members": [{"key": "/people/bob"}],
+        }
+        ol = self._ol_with(user_doc=user, group_doc=group)
+
+        with patch("shelfie.cli.infobase_save") as mock_save:
+            cmd_set_role(ol, username="alice", role="admin", action="remove")
+
+        mock_save.assert_not_called()
+        assert "not in" in capsys.readouterr().out
+
+    def test_unknown_user_aborts_before_save(self, capsys):
+        ol = self._ol_with(missing=["/people/ghost"])
+
+        with patch("shelfie.cli.infobase_save") as mock_save:
+            cmd_set_role(ol, username="ghost", role="admin", action="add")
+
+        mock_save.assert_not_called()
+        assert "not found" in capsys.readouterr().out
