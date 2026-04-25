@@ -55,7 +55,8 @@ docker compose run --rm shelfie set-role --username openlibrary --role admin
 docker compose run --rm shelfie reset
 
 # Verification
-docker compose run --rm shelfie smoke-test
+docker compose run --rm shelfie health-check    # is my stack reachable + login working?
+docker compose run --rm shelfie smoke-test      # shelfie's own regression suite (developer use)
 ```
 
 Run `docker compose run --rm shelfie <command> --help` for per-command flags.
@@ -77,7 +78,8 @@ Run `docker compose run --rm shelfie <command> --help` for per-command flags.
 | `stats` | Cross-reference infobase and Solr counts; surface coverage and sync drift. |
 | `manage-solr` | Check Solr index status; reindex specific work keys. |
 | `reset` | Mark shelfie-imported books, lists, or series as deleted. Has a "nuclear" option that prints the docker volume teardown command. |
-| `smoke-test` | Regression battery for bugs from PR #12157 review — run after editing `cli.py`. |
+| `health-check` | Diagnostic: pings `web`, `infobase`, `solr` and verifies login. Run this first when something looks off. |
+| `smoke-test` | Regression battery for bugs from PR #12157 review — run after editing `cli.py` (developer use). |
 
 ## Defaults
 

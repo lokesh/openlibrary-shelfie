@@ -414,7 +414,14 @@ def _import_books(ol, records, workers=IMPORT_WORKERS):
 
 
 def cmd_add_books(ol, count=10, source="production"):
-    """Import books - from openlibrary.org (default) or local seed data."""
+    """Import books - from openlibrary.org (default) or local seed data.
+
+    Other commands fall back to seed data silently when prod is
+    unreachable. add-books is the only one with an explicit `--source`
+    flag because it's the most common offline workflow (demos, plane
+    rides, fast iteration) — the flag lets users skip the slow prod
+    fetch entirely instead of waiting for it to time out.
+    """
     header("Add Books")
 
     if source == "production":
@@ -1596,6 +1603,71 @@ def cmd_reset_state(ol):
 
 
 # ---------------------------------------------------------------------------
+# Feature: Health Check
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_SOLR_URL = "http://solr:8983"
+
+
+def cmd_health_check(url=None, email=None, password=None):
+    """Verify the local OL stack is reachable and login works.
+
+    Distinct from `smoke-test`: this is for users diagnosing setup
+    problems ("is my stack up?"), while smoke-test is a regression
+    battery for shelfie's own bugs. Doesn't piggy-back on `connect()`
+    so the login attempt is a real, testable step.
+    """
+    header("Health Check")
+
+    url = url or DEFAULT_BASE_URL
+    email = email or DEFAULT_LOGIN_EMAIL
+    password = password or DEFAULT_LOGIN_PASSWORD
+
+    failures = []
+
+    def _check(name, ok, detail=""):
+        if ok:
+            console.print(f"  [green bold]PASS[/green bold]  {name}", highlight=False)
+        else:
+            console.print(f"  [red bold]FAIL[/red bold]  {name}: {detail}", highlight=False)
+            failures.append(name)
+
+    def _reachable(target_url):
+        try:
+            resp = requests.get(target_url, timeout=5, allow_redirects=False)
+        except requests.RequestException as e:
+            return False, str(e)
+        # Any HTTP response means the server is up. 4xx/5xx still proves
+        # the port is open and a service is answering.
+        return True, f"HTTP {resp.status_code}"
+
+    ok, detail = _reachable(url + "/")
+    _check(f"web reachable ({url})", ok, detail)
+
+    ok, detail = _reachable(DEFAULT_INFOBASE_URL + "/things")
+    _check(f"infobase reachable ({DEFAULT_INFOBASE_URL})", ok, detail)
+
+    ok, detail = _reachable(DEFAULT_SOLR_URL + "/solr/admin/info/system")
+    _check(f"solr reachable ({DEFAULT_SOLR_URL})", ok, detail)
+
+    try:
+        ol = OLClient(url)
+        ol.login(email, password)
+        _check(f"login as {email}", bool(ol.cookie), "no session cookie returned")
+    except (OLError, requests.RequestException) as e:
+        _check(f"login as {email}", False, str(e))
+
+    console.print()
+    if failures:
+        error(f"[bold]{len(failures)}[/bold] check(s) failed.")
+        dim("  See README troubleshooting for network-name and login defaults.")
+        return 1
+    success("Stack is healthy.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Feature: Smoke Test
 # ---------------------------------------------------------------------------
 
@@ -1747,6 +1819,7 @@ MENU_OPTIONS = [
     "List users",
     "Manage Solr index",
     "Stats",
+    "Health check",
     "Smoke test",
     "Reset local state",
     "Exit",
@@ -1800,6 +1873,7 @@ _MENU_DISPATCH = {
     "List users": cmd_list_users,
     "Manage Solr index": cmd_manage_solr,
     "Stats": cmd_stats,
+    "Health check": lambda ol: cmd_health_check(),
     "Smoke test": cmd_smoke_test,
     "Reset local state": cmd_reset_state,
 }
@@ -1924,8 +1998,11 @@ def build_parser():
     # reset
     sub.add_parser("reset", help="Reset local dev data")
 
+    # health-check
+    sub.add_parser("health-check", help="Verify web/infobase/solr are reachable and login works")
+
     # smoke-test
-    sub.add_parser("smoke-test", help="Run regression checks for known PR #12157 bugs")
+    sub.add_parser("smoke-test", help="Run regression checks for known PR #12157 bugs (developer use)")
 
     return parser
 
@@ -1938,6 +2015,10 @@ def main():
     if not args.command:
         interactive_menu()
         return
+
+    # health-check runs its own login as a measured step — skip auto-connect.
+    if args.command == "health-check":
+        raise SystemExit(cmd_health_check(args.url, args.email, args.password))
 
     ol = connect(args.url, args.email, args.password)
 

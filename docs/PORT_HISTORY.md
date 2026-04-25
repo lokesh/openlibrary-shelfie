@@ -1,4 +1,6 @@
-# Plan: Extract shelfie to `openlibrary-shelfie`
+# Port history: extracting shelfie from `internetarchive/openlibrary`
+
+> **Historical document.** This is the original port plan from when shelfie was extracted out of `scripts/shelfie.py` in the OL repo. Preserved for context on early decisions ("port, don't refactor", network-name assumption, OLClient fidelity). It is **not** current direction — see `README.md` for that.
 
 Target repo: `github.com/lokeshdhakar/openlibrary-shelfie`. Keep the change minimal — port, don't refactor.
 
