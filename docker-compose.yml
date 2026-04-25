@@ -1,0 +1,14 @@
+services:
+  shelfie:
+    build: .
+    image: openlibrary-shelfie
+    networks:
+      - openlibrary_webnet
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+
+networks:
+  openlibrary_webnet:
+    external: true

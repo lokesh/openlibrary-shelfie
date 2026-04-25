@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openlibrary-shelfie"
+version = "0.1.0"
+description = "Interactive dev tool that populates a local Open Library instance with realistic data."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Lokesh Dhakar" }]
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+shelfie = "shelfie.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lokeshdhakar/openlibrary-shelfie"
+
+[tool.setuptools.packages.find]
+include = ["shelfie*"]
+
+[tool.setuptools.package-data]
+shelfie = []
