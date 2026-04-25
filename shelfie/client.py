@@ -21,7 +21,7 @@ class OLError(Exception):
         Exception.__init__(self, f"{e}. Response: {self.text}")
 
 
-class OpenLibrary:
+class OLClient:
     def __init__(self, base_url="https://openlibrary.org"):
         self.base_url = base_url.rstrip("/") if base_url else "https://openlibrary.org"
         self.cookie = None

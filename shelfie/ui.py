@@ -8,12 +8,10 @@ from contextlib import contextmanager
 
 import questionary
 from questionary import Style as QStyle
-from rich.box import HEAVY_HEAD
+from rich.box import SIMPLE_HEAVY
 from rich.columns import Columns
 from rich.console import Console
-from rich.live import Live
 from rich.padding import Padding
-from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     Progress,
@@ -52,10 +50,21 @@ class UserExit(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _ask(question):
+    """Run a questionary question; raise UserExit on cancel."""
+    try:
+        result = question.ask()
+    except KeyboardInterrupt:
+        raise UserExit
+    if result is None:
+        raise UserExit
+    return result
+
+
 def choose(prompt, options):
     """Arrow-key menu. Returns the selected option."""
-    try:
-        result = questionary.select(
+    return _ask(
+        questionary.select(
             prompt,
             choices=options,
             style=QSTYLE,
@@ -63,37 +72,20 @@ def choose(prompt, options):
             instruction="(↑/↓ then enter, esc to quit)",
             use_indicator=False,
             pointer="❯",
-        ).ask()
-    except KeyboardInterrupt:
-        raise UserExit
-    if result is None:
-        raise UserExit
-    return result
+        )
+    )
 
 
 def ask(prompt, default=""):
     """Free-text prompt with optional default."""
-    try:
-        result = questionary.text(
-            prompt, default=default, style=QSTYLE, qmark="?"
-        ).ask()
-    except KeyboardInterrupt:
-        raise UserExit
-    if result is None:
-        raise UserExit
-    return result
+    return _ask(questionary.text(prompt, default=default, style=QSTYLE, qmark="?"))
 
 
 def confirm(prompt):
     """Y/N prompt. Defaults to no."""
-    try:
-        return bool(
-            questionary.confirm(
-                prompt, default=False, style=QSTYLE, qmark="?"
-            ).ask()
-        )
-    except KeyboardInterrupt:
-        raise UserExit
+    return bool(
+        _ask(questionary.confirm(prompt, default=False, style=QSTYLE, qmark="?"))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,33 +112,45 @@ def banner(server_url, stats_pairs):
     )
 
     # Stats laid out as a 2-col borderless table — labels dim, values bold.
-    stats_table = Table.grid(padding=(0, 2))
-    stats_table.add_column(style="dim")
-    stats_table.add_column(justify="right", style="bold cyan")
-    stats_table.add_column(style="dim")
-    stats_table.add_column(justify="right", style="bold cyan")
+    stats = Table.grid(padding=(0, 2))
+    stats.add_column(style="dim")
+    stats.add_column(justify="right", style="bold cyan")
+    stats.add_column(style="dim")
+    stats.add_column(justify="right", style="bold cyan")
 
     pairs = list(stats_pairs)
-    # Two rows side-by-side
     for i in range(0, len(pairs), 2):
         left = pairs[i]
         right = pairs[i + 1] if i + 1 < len(pairs) else ("", "")
-        stats_table.add_row(left[0], str(left[1]), right[0], str(right[1]))
+        stats.add_row(left[0], str(left[1]), right[0], str(right[1]))
 
     body = Table.grid(padding=(0, 0))
     body.add_column()
     body.add_row(logo)
     body.add_row("")
-    body.add_row(
-        Text.from_markup(
-            f"[bold]shelfie[/bold] [dim]·[/dim] Open Library Dev Tool"
-        )
-    )
+    body.add_row(Text.from_markup("[bold]shelfie[/bold] [dim]·[/dim] Open Library Dev Tool"))
     body.add_row(Text.from_markup(f"[dim]connected to[/dim] [cyan]{server_url}[/cyan]"))
     body.add_row("")
-    body.add_row(stats_table)
+    body.add_row(stats)
 
     console.print(Padding(body, (1, 2)))
+
+
+def stats_table(title, rows):
+    """Build a small two-column (label, value) table for stats panes."""
+    table = Table(
+        title=f"[bold cyan]{title}[/bold cyan]",
+        title_justify="left",
+        show_header=False,
+        box=SIMPLE_HEAVY,
+        pad_edge=False,
+        expand=False,
+    )
+    table.add_column(style="dim")
+    table.add_column(justify="right", style="bold")
+    for label, value in rows:
+        table.add_row(label, str(value))
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +225,26 @@ def step_progress():
     )
 
 
-# Re-exports so cli.py only imports from ui.
+def failure_logger(progress, limit=3):
+    """Returns a callable that prints up to `limit` formatted failures
+    inside the given progress, then silently swallows the rest.
+
+    Why: long batches with thousands of items shouldn't dump every error
+    to the console — the first few are usually enough to diagnose.
+    """
+    shown = 0
+
+    def log(label, err):
+        nonlocal shown
+        if shown < limit:
+            progress.console.print(
+                f"  [red]✗[/red] {label} [dim]—[/dim] {err}", highlight=False
+            )
+            shown += 1
+
+    return log
+
+
 __all__ = [
     "console",
     "UserExit",
@@ -230,6 +253,7 @@ __all__ = [
     "confirm",
     "header",
     "banner",
+    "stats_table",
     "success",
     "info",
     "warn",
@@ -239,11 +263,9 @@ __all__ = [
     "spinner",
     "import_progress",
     "step_progress",
+    "failure_logger",
+    # Re-exports for cli.py table-building.
     "Table",
-    "Panel",
     "Columns",
-    "Padding",
-    "Text",
-    "HEAVY_HEAD",
-    "Live",
+    "SIMPLE_HEAVY",
 ]

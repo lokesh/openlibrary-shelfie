@@ -25,7 +25,7 @@ Run as a sidecar against a running Open Library stack:
 #   - web (port 8080):     The main OL web app. Used for authenticated
 #                          operations like importing books, creating lists,
 #                          and posting ratings via the bundled OLClient
-#                          (shelfie.client.OpenLibrary).
+#                          (shelfie.client.OLClient).
 #
 #   - infobase (port 7000): The low-level datastore. Used for direct writes
 #                           that bypass web-app save bugs in local dev -
@@ -76,12 +76,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
-from rich.box import SIMPLE_HEAVY
-from rich.columns import Columns
-from rich.table import Table
 
-from .client import OLError, OpenLibrary
+from .client import OLClient, OLError
 from .ui import (
+    SIMPLE_HEAVY,
+    Columns,
+    Table,
     UserExit,
     ask,
     banner,
@@ -90,11 +90,13 @@ from .ui import (
     console,
     dim,
     error,
+    failure_logger,
     header,
     import_progress,
     info,
     plain,
     spinner,
+    stats_table,
     step_progress,
     success,
     warn,
@@ -132,7 +134,7 @@ def connect(base_url=None, email=None, password=None):
     base_url = base_url or DEFAULT_BASE_URL
     email = email or DEFAULT_LOGIN_EMAIL
     password = password or DEFAULT_LOGIN_PASSWORD
-    ol = OpenLibrary(base_url)
+    ol = OLClient(base_url)
     try:
         with spinner(f"Logging in as {email}…"):
             ol.login(email, password)
@@ -392,10 +394,10 @@ def _import_books(ol, records, workers=IMPORT_WORKERS):
     success_count = 0
     errors = 0
     total = len(records)
-    failures_shown = 0
 
     with import_progress() as progress:
         task = progress.add_task("Importing books", total=total, ok=0, err=0)
+        log_failure = failure_logger(progress)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_import_one_book, ol, r): r for r in records}
             for fut in as_completed(futures):
@@ -405,12 +407,7 @@ def _import_books(ol, records, workers=IMPORT_WORKERS):
                     success_count += 1
                 else:
                     errors += 1
-                    if failures_shown < 3:
-                        progress.console.print(
-                            f"  [red]✗[/red] {record['title']} [dim]—[/dim] {err_msg}",
-                            highlight=False,
-                        )
-                        failures_shown += 1
+                    log_failure(record["title"], err_msg)
                 progress.update(task, advance=1, ok=success_count, err=errors)
 
     return success_count, errors
@@ -758,10 +755,10 @@ def cmd_populate_subjects(ol):
     updated = 0
     skipped = 0
     errors = 0
-    failures_shown = 0
 
     with step_progress() as progress:
         task = progress.add_task("Populating subjects", total=len(all_works))
+        log_failure = failure_logger(progress)
         # ol.query returns Reference strings like "/works/OL1W", not dicts
         for work_ref in all_works:
             work_key = str(work_ref)
@@ -798,11 +795,7 @@ def cmd_populate_subjects(ol):
                 updated += 1
             except requests.RequestException as e:
                 errors += 1
-                if failures_shown < 3:
-                    progress.console.print(
-                        f"  [red]✗[/red] {work_key} [dim]—[/dim] {e}", highlight=False
-                    )
-                    failures_shown += 1
+                log_failure(work_key, e)
             progress.update(task, advance=1)
 
     console.print()
@@ -865,10 +858,10 @@ def cmd_populate_covers(ol, limit=100):
     updated = 0
     no_match = 0
     errors = 0
-    failures_shown = 0
 
     with import_progress() as progress:
         task = progress.add_task("Populating covers", total=len(targets), ok=0, err=0)
+        log_failure = failure_logger(progress)
         for key, title, author in targets:
             cover_id = _find_prod_cover_id(title, author)
             if not cover_id:
@@ -884,11 +877,7 @@ def cmd_populate_covers(ol, limit=100):
                     updated += 1
                 except requests.RequestException as e:
                     errors += 1
-                    if failures_shown < 3:
-                        progress.console.print(
-                            f"  [red]✗[/red] {key} [dim]—[/dim] {e}", highlight=False
-                        )
-                        failures_shown += 1
+                    log_failure(key, e)
             progress.update(task, advance=1, ok=updated, err=errors + no_match)
 
     console.print()
@@ -937,49 +926,44 @@ def _solr_facet_count(field):
     return "?"
 
 
-def _stats_table(title, rows):
-    """Build a small two-column table of (label, value) rows."""
-    table = Table(
-        title=f"[bold cyan]{title}[/bold cyan]",
-        title_justify="left",
-        show_header=False,
-        box=SIMPLE_HEAVY,
-        pad_edge=False,
-        expand=False,
-    )
-    table.add_column(style="dim")
-    table.add_column(justify="right", style="bold")
-    for label, value in rows:
-        table.add_row(label, str(value))
-    return table
-
-
 def cmd_stats(ol):
     """Show database statistics."""
     header("Database Stats")
 
-    with spinner("Fetching counts…"):
-        db_counts = {
-            "Works": _infobase_count("/type/work"),
-            "Editions": _infobase_count("/type/edition"),
-            "Authors": _infobase_count("/type/author"),
-            "Users": _infobase_count("/type/user"),
-            "Lists": _infobase_count("/type/list"),
-            "Series": _infobase_count("/type/series"),
-            "Usergroups": _infobase_count("/type/usergroup"),
-        }
-        solr_counts = {
-            "Works": _solr_count("type:work"),
-            "Editions": _solr_count("type:edition"),
-            "Authors": _solr_count("type:author"),
-            "Total docs": _solr_count("*:*"),
-        }
-        works_with_covers = _solr_count("type:work AND cover_i:[* TO *]")
-        works_with_subjects = _solr_count("type:work AND subject:[* TO *]")
-        unique_subjects = _solr_facet_count("subject")
+    db_specs = [
+        ("Works", _infobase_count, "/type/work"),
+        ("Editions", _infobase_count, "/type/edition"),
+        ("Authors", _infobase_count, "/type/author"),
+        ("Users", _infobase_count, "/type/user"),
+        ("Lists", _infobase_count, "/type/list"),
+        ("Series", _infobase_count, "/type/series"),
+        ("Usergroups", _infobase_count, "/type/usergroup"),
+    ]
+    solr_specs = [
+        ("Works", _solr_count, "type:work"),
+        ("Editions", _solr_count, "type:edition"),
+        ("Authors", _solr_count, "type:author"),
+        ("Total docs", _solr_count, "*:*"),
+    ]
+    extra_calls = [
+        ("works_with_covers", _solr_count, "type:work AND cover_i:[* TO *]"),
+        ("works_with_subjects", _solr_count, "type:work AND subject:[* TO *]"),
+        ("unique_subjects", _solr_facet_count, "subject"),
+    ]
 
-    db_table = _stats_table("Database (infobase)", list(db_counts.items()))
-    solr_table = _stats_table("Search Index (Solr)", list(solr_counts.items()))
+    with spinner("Fetching counts…"):
+        with ThreadPoolExecutor(max_workers=14) as pool:
+            db_futures = [(label, pool.submit(fn, arg)) for label, fn, arg in db_specs]
+            solr_futures = [(label, pool.submit(fn, arg)) for label, fn, arg in solr_specs]
+            extras = {key: pool.submit(fn, arg) for key, fn, arg in extra_calls}
+            db_counts = {label: f.result() for label, f in db_futures}
+            solr_counts = {label: f.result() for label, f in solr_futures}
+            works_with_covers = extras["works_with_covers"].result()
+            works_with_subjects = extras["works_with_subjects"].result()
+            unique_subjects = extras["unique_subjects"].result()
+
+    db_table = stats_table("Database (infobase)", list(db_counts.items()))
+    solr_table = stats_table("Search Index (Solr)", list(solr_counts.items()))
 
     # Coverage rows include a percentage when both numbers are integers.
     total_works = solr_counts.get("Works", 0)
@@ -990,7 +974,7 @@ def cmd_stats(ol):
             return label, f"{n} ({pct}%)"
         return label, str(n)
 
-    coverage_table = _stats_table(
+    coverage_table = stats_table(
         "Coverage",
         [
             _coverage_row("Works with covers", works_with_covers),
@@ -1044,7 +1028,7 @@ def cmd_manage_solr(ol):
         if data:
             num_docs = data.get("response", {}).get("numFound", "?")
             rows = [("Total documents", num_docs)] + [(f"{t}s", n) for t, n in type_counts.items()]
-            console.print(_stats_table("Solr Index", rows))
+            console.print(stats_table("Solr Index", rows))
         else:
             error("Could not connect to Solr at solr:8983")
 
@@ -1769,27 +1753,6 @@ MENU_OPTIONS = [
 ]
 
 
-# Maps menu labels to the callable that runs them. Each handler takes `ol`
-# and is responsible for any further prompts.
-def _menu_dispatch():
-    return {
-        "Populate everything": lambda ol: cmd_populate_all(ol),
-        "Add books": _menu_add_books,
-        "Generate lists": _menu_generate_lists,
-        "Seed reading log": _menu_seed_reading_log,
-        "Seed series": _menu_seed_series,
-        "Seed reviews & ratings": _menu_seed_ratings,
-        "Populate subjects on existing books": lambda ol: cmd_populate_subjects(ol),
-        "Populate covers on existing books": _menu_populate_covers,
-        "Change user role": lambda ol: cmd_set_role(ol),
-        "List users": lambda ol: cmd_list_users(ol),
-        "Manage Solr index": lambda ol: cmd_manage_solr(ol),
-        "Stats": lambda ol: cmd_stats(ol),
-        "Smoke test": lambda ol: cmd_smoke_test(ol),
-        "Reset local state": lambda ol: cmd_reset_state(ol),
-    }
-
-
 def _menu_add_books(ol):
     count_choice = choose("How many books?", ["10", "100", "1000"])
     source_choice = choose("Source?", ["Production (openlibrary.org)", "Seed data (offline)"])
@@ -1822,18 +1785,46 @@ def _menu_populate_covers(ol):
     cmd_populate_covers(ol, limit=int(limit_choice))
 
 
+# Maps menu labels to the callable that runs them. Each handler takes `ol`
+# and is responsible for any further prompts.
+_MENU_DISPATCH = {
+    "Populate everything": cmd_populate_all,
+    "Add books": _menu_add_books,
+    "Generate lists": _menu_generate_lists,
+    "Seed reading log": _menu_seed_reading_log,
+    "Seed series": _menu_seed_series,
+    "Seed reviews & ratings": _menu_seed_ratings,
+    "Populate subjects on existing books": cmd_populate_subjects,
+    "Populate covers on existing books": _menu_populate_covers,
+    "Change user role": cmd_set_role,
+    "List users": cmd_list_users,
+    "Manage Solr index": cmd_manage_solr,
+    "Stats": cmd_stats,
+    "Smoke test": cmd_smoke_test,
+    "Reset local state": cmd_reset_state,
+}
+
+
 def _compute_startup_stats():
-    """Return [(label, value)] pairs for the banner stats panel."""
-    return [
-        ("works", _infobase_count("/type/work")),
-        ("editions", _infobase_count("/type/edition")),
-        ("authors", _infobase_count("/type/author")),
-        ("covers", _solr_count("type:work AND cover_i:[* TO *]")),
-        ("lists", _infobase_count("/type/list")),
-        ("series", _infobase_count("/type/series")),
-        ("subjects", _solr_facet_count("subject")),
-        ("users", _infobase_count("/type/user")),
+    """Return [(label, value)] pairs for the banner stats panel.
+
+    Calls run in parallel — banner load time was the biggest startup
+    latency before this; serial these would block first paint by ~8x
+    one HTTP round trip each.
+    """
+    specs = [
+        ("works", _infobase_count, "/type/work"),
+        ("editions", _infobase_count, "/type/edition"),
+        ("authors", _infobase_count, "/type/author"),
+        ("covers", _solr_count, "type:work AND cover_i:[* TO *]"),
+        ("lists", _infobase_count, "/type/list"),
+        ("series", _infobase_count, "/type/series"),
+        ("subjects", _solr_facet_count, "subject"),
+        ("users", _infobase_count, "/type/user"),
     ]
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = [(label, pool.submit(fn, arg)) for label, fn, arg in specs]
+        return [(label, f.result()) for label, f in futures]
 
 
 def interactive_menu():
@@ -1844,7 +1835,6 @@ def interactive_menu():
 
     ol = connect()
 
-    dispatch = _menu_dispatch()
     while True:
         try:
             console.print()
@@ -1853,7 +1843,7 @@ def interactive_menu():
             if choice == "Exit":
                 dim("Bye!")
                 break
-            handler = dispatch.get(choice)
+            handler = _MENU_DISPATCH.get(choice)
             if handler:
                 handler(ol)
         except UserExit:

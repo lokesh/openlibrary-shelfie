@@ -81,7 +81,7 @@ Run `docker compose run --rm shelfie <command> --help` for per-command flags.
 
 ## Defaults
 
-- Login: `admin@example.com` / `admin123` (the dev DB bootstrap user)
+- Login: `openlibrary@example.com` / `admin123` (the dev DB bootstrap user)
 - Targets: `http://web:8080`, `http://infobase:7000/openlibrary`, `http://solr:8983`
 
 Override per-command with `--url`, `--email`, `--password`.
