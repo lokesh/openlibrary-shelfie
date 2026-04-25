@@ -76,15 +76,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
+from rich.box import SIMPLE_HEAVY
+from rich.columns import Columns
+from rich.table import Table
 
 from .client import OLError, OpenLibrary
+from .ui import (
+    UserExit,
+    ask,
+    banner,
+    choose,
+    confirm,
+    console,
+    dim,
+    error,
+    header,
+    import_progress,
+    info,
+    plain,
+    spinner,
+    step_progress,
+    success,
+    warn,
+)
 
 DEV_DATA_DIR = Path(__file__).parent.parent / "seed_data"
 DEFAULT_BASE_URL = "http://web:8080"
 DEFAULT_INFOBASE_URL = "http://infobase:7000/openlibrary"
-DEFAULT_LOGIN_EMAIL = "admin@example.com"
+DEFAULT_LOGIN_EMAIL = "openlibrary@example.com"
 DEFAULT_LOGIN_PASSWORD = "admin123"
-DEFAULT_USERNAME = "admin"
+DEFAULT_USERNAME = "openlibrary"
 
 USERGROUPS = [
     "admin",
@@ -106,62 +127,6 @@ def load_json(filename):
         return json.load(f)
 
 
-def print_header(title):
-    width = 50
-    print()
-    print("=" * width)
-    print(f"  {title}")
-    print("=" * width)
-
-
-def print_menu(options):
-    for i, label in enumerate(options, 1):
-        print(f"  {i}. {label}")
-    print()
-
-
-class UserExit(Exception):
-    """Raised when user wants to quit."""
-
-
-def choose(prompt, options):
-    """Prompt user to pick from a list. Returns the chosen value."""
-    print_menu(options)
-    while True:
-        try:
-            raw = input(f"{prompt} [1-{len(options)}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            raise UserExit
-        if raw.lower() in ("exit", "quit", "q", "\x1b"):
-            raise UserExit
-        try:
-            idx = int(raw) - 1
-            if 0 <= idx < len(options):
-                return options[idx]
-        except ValueError:
-            pass
-        print(f"  Please enter a number between 1 and {len(options)}.")
-
-
-def ask(prompt, default=""):
-    """Prompt for text input with an optional default."""
-    suffix = f" [{default}]" if default else ""
-    try:
-        raw = input(f"{prompt}{suffix}: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        raise UserExit
-    if raw.lower() in ("exit", "quit"):
-        raise UserExit
-    return raw or default
-
-
-def confirm(prompt):
-    try:
-        return input(f"{prompt} (y/n): ").strip().lower() in ("y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        raise UserExit
-
-
 def connect(base_url=None, email=None, password=None):
     """Create and authenticate an OL client."""
     base_url = base_url or DEFAULT_BASE_URL
@@ -169,14 +134,15 @@ def connect(base_url=None, email=None, password=None):
     password = password or DEFAULT_LOGIN_PASSWORD
     ol = OpenLibrary(base_url)
     try:
-        ol.login(email, password)
+        with spinner(f"Logging in as {email}…"):
+            ol.login(email, password)
         if ol.cookie:
-            print(f"  Logged in as '{email}'.")
+            success(f"Logged in as [cyan]{email}[/cyan]")
         else:
-            print(f"  Warning: login returned no session cookie for '{email}'.")
-            print("  Some features (imports, role changes) may not work.")
+            warn(f"Login returned no session cookie for [cyan]{email}[/cyan]")
+            dim("  Some features (imports, role changes) may not work.")
     except (OLError, requests.RequestException) as e:
-        print(f"  Warning: login failed ({e}). Continuing without auth.")
+        warn(f"Login failed ({e}). Continuing without auth.")
     return ol
 
 
@@ -234,7 +200,7 @@ def solr_request(path, base_url=None):
         resp.raise_for_status()
         return resp.json()
     except (requests.RequestException, ValueError, KeyError) as e:
-        print(f"  Solr error: {e}")
+        error(f"Solr error: {e}")
         return None
 
 
@@ -423,47 +389,50 @@ def _import_one_book(ol, record):
 def _import_books(ol, records, workers=IMPORT_WORKERS):
     """Import records in parallel. /api/import is one-book-per-call so the
     only lever for speed is concurrency."""
-    success = 0
+    success_count = 0
     errors = 0
     total = len(records)
-    done = 0
+    failures_shown = 0
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_import_one_book, ol, r): r for r in records}
-        for fut in as_completed(futures):
-            record = futures[fut]
-            ok, err_msg = fut.result()
-            if ok:
-                success += 1
-            else:
-                errors += 1
-                if errors <= 3:
-                    print(f"  Failed: {record['title']} - {err_msg}")
+    with import_progress() as progress:
+        task = progress.add_task("Importing books", total=total, ok=0, err=0)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_import_one_book, ol, r): r for r in records}
+            for fut in as_completed(futures):
+                record = futures[fut]
+                ok, err_msg = fut.result()
+                if ok:
+                    success_count += 1
+                else:
+                    errors += 1
+                    if failures_shown < 3:
+                        progress.console.print(
+                            f"  [red]✗[/red] {record['title']} [dim]—[/dim] {err_msg}",
+                            highlight=False,
+                        )
+                        failures_shown += 1
+                progress.update(task, advance=1, ok=success_count, err=errors)
 
-            done += 1
-            if done % 10 == 0 or done == total:
-                print(f"  Progress: {done}/{total} ({GREEN}success={success}{RESET}, {RED}errors={errors}{RESET})")
-
-    return success, errors
+    return success_count, errors
 
 
 def cmd_add_books(ol, count=10, source="production"):
     """Import books - from openlibrary.org (default) or local seed data."""
-    print_header("Add Books")
+    header("Add Books")
 
     if source == "production":
-        print(f"  Fetching {count} books from openlibrary.org...")
-        records = _fetch_books_from_prod(count)
+        with spinner(f"Fetching {count} books from openlibrary.org…"):
+            records = _fetch_books_from_prod(count)
         if not records:
-            print("  Could not reach openlibrary.org. Falling back to seed data.")
+            warn("Could not reach openlibrary.org. Falling back to seed data.")
             source = "seed"
         else:
-            print(f"  Fetched {len(records)} unique books (with covers & subjects).")
+            info(f"Fetched [cyan]{len(records)}[/cyan] unique books (with covers & subjects).")
 
     if source == "seed":
         books = load_json("books.json")
         total_available = len(books)
-        print(f"  Using seed file ({total_available} books).")
+        info(f"Using seed file ([cyan]{total_available}[/cyan] books).")
         records = []
         for i in range(count):
             book = books[i % total_available]
@@ -479,13 +448,14 @@ def cmd_add_books(ol, count=10, source="production"):
                 record["number_of_pages"] = book["number_of_pages"]
             records.append(record)
 
-    success, errors = _import_books(ol, records)
+    succeeded, errors = _import_books(ol, records)
 
-    print(f"\n  Done! {GREEN}{success} books imported{RESET}, {RED}{errors} errors{RESET}.")
-    if success > 0:
-        print(f"  {DIM}Tip: Books may not appear in search until Solr reindexes.")
-        print(f"  Use 'Manage Solr Index' or wait for solr-updater to catch up.{RESET}")
-    return success
+    console.print()
+    success(f"[bold]{succeeded}[/bold] books imported, [red]{errors}[/red] errors.")
+    if succeeded > 0:
+        dim("Tip: books may not appear in search until Solr reindexes.")
+        dim("Use 'Manage Solr Index' or wait for solr-updater to catch up.")
+    return succeeded
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +465,7 @@ def cmd_add_books(ol, count=10, source="production"):
 
 def cmd_set_role(ol, username=None, role=None, action="add"):
     """Add or remove a user from a usergroup."""
-    print_header("Change User Role")
+    header("Change User Role")
 
     if not username:
         username = ask("Enter username (e.g. openlibrary)", DEFAULT_USERNAME)
@@ -505,9 +475,9 @@ def cmd_set_role(ol, username=None, role=None, action="add"):
     # Verify user exists
     try:
         user = ol.get(user_key)
-        print(f"  Found user: {user.get('displayname', username)}")
+        info(f"Found user: [cyan]{user.get('displayname', username)}[/cyan]")
     except OLError:
-        print(f"  Error: user '{username}' not found.")
+        error(f"User '[cyan]{username}[/cyan]' not found.")
         return
 
     # Show current groups
@@ -523,11 +493,11 @@ def cmd_set_role(ol, username=None, role=None, action="add"):
             except OLError:
                 pass
         if current_groups:
-            print(f"  Current roles: {', '.join(current_groups)}")
+            info(f"Current roles: [yellow]{', '.join(current_groups)}[/yellow]")
         else:
-            print("  Current roles: (none)")
+            dim("Current roles: (none)")
     except (OLError, requests.RequestException) as e:
-        print(f"  Could not fetch current roles: {e}")
+        warn(f"Could not fetch current roles: {e}")
 
     if not role:
         action_choice = choose("Action", ["Add role", "Remove role"])
@@ -539,7 +509,7 @@ def cmd_set_role(ol, username=None, role=None, action="add"):
     try:
         group = ol.get(group_key)
     except OLError:
-        print(f"  Error: usergroup '{role}' not found.")
+        error(f"Usergroup '[cyan]{role}[/cyan]' not found.")
         return
 
     raw_members = group.get("members", [])
@@ -548,12 +518,12 @@ def cmd_set_role(ol, username=None, role=None, action="add"):
 
     if action == "add":
         if user_key in member_keys:
-            print(f"  User '{username}' is already in '{role}'.")
+            warn(f"User '[cyan]{username}[/cyan]' is already in '[yellow]{role}[/yellow]'.")
             return
         member_keys.append(user_key)
     else:
         if user_key not in member_keys:
-            print(f"  User '{username}' is not in '{role}'.")
+            warn(f"User '[cyan]{username}[/cyan]' is not in '[yellow]{role}[/yellow]'.")
             return
         member_keys = [k for k in member_keys if k != user_key]
 
@@ -570,9 +540,9 @@ def cmd_set_role(ol, username=None, role=None, action="add"):
         )
         verb = "Added" if action == "add" else "Removed"
         prep = "to" if action == "add" else "from"
-        print(f"  {verb} '{username}' {prep} '{role}'.")
+        success(f"{verb} '[cyan]{username}[/cyan]' {prep} '[yellow]{role}[/yellow]'.")
     except requests.RequestException as e:
-        print(f"  Error saving group: {e}")
+        error(f"Saving group: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -687,25 +657,25 @@ def _import_list_seeds(ol, prod_list):
 
 def cmd_generate_lists(ol, count=1, username=None):
     """Create reading lists from real openlibrary.org lists."""
-    print_header("Generate Lists")
+    header("Generate Lists")
 
     if not username:
         username = ask("Enter username for list owner", DEFAULT_USERNAME)
 
     if not _user_exists(ol, username):
-        print(f"  Error: user '/people/{username}' not found. Create the user first.")
+        error(f"User '[cyan]/people/{username}[/cyan]' not found. Create the user first.")
         return
 
-    print("  Fetching real lists from openlibrary.org...")
-    prod_lists = _fetch_prod_lists(count)
+    with spinner("Fetching real lists from openlibrary.org…"):
+        prod_lists = _fetch_prod_lists(count)
 
     if not prod_lists:
-        print("  Could not fetch lists from production. Using local works instead.")
+        warn("Could not fetch lists from production. Using local works instead.")
         list_templates = load_json("list_names.json")
         work_keys = get_work_keys(ol)
 
         if not work_keys:
-            print("  No works found. Add books first!")
+            error("No works found. Add books first!")
             return
 
         for i in range(count):
@@ -719,16 +689,17 @@ def cmd_generate_lists(ol, count=1, username=None):
                 }
             )
 
-    print(f"  Got {len(prod_lists)} lists. Importing seed works and creating lists...")
+    info(f"Got [cyan]{len(prod_lists)}[/cyan] lists. Importing seed works and creating lists…")
 
-    success = 0
+    succeeded = 0
     for pl in prod_lists[:count]:
-        imported_keys = _import_list_seeds(ol, pl)
+        with spinner(f"Importing seeds for '{pl['name']}'…"):
+            imported_keys = _import_list_seeds(ol, pl)
 
         # Create the list locally with only successfully imported work keys
         seeds = [{"key": k} for k in imported_keys if k]
         if not seeds:
-            print(f"  Skipping '{pl['name']}': no works could be imported")
+            warn(f"Skipping '[cyan]{pl['name']}[/cyan]': no works could be imported")
             continue
 
         list_data = json.dumps(
@@ -748,12 +719,13 @@ def cmd_generate_lists(ol, count=1, username=None):
             )
             result = resp.json()
             list_key = result.get("key", "?")
-            print(f"  Created: {pl['name']} ({list_key}) with {len(seeds)} seeds")
-            success += 1
+            success(f"Created [cyan]{pl['name']}[/cyan] [dim]({list_key})[/dim] with {len(seeds)} seeds")
+            succeeded += 1
         except (OLError, requests.RequestException, json.JSONDecodeError) as e:
-            print(f"  Error creating list '{pl['name']}': {e}")
+            error(f"Creating list '[cyan]{pl['name']}[/cyan]': {e}")
 
-    print(f"\n  Done! {GREEN}{success}/{count} lists created.{RESET}")
+    console.print()
+    success(f"[bold]{succeeded}/{count}[/bold] lists created.")
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +735,7 @@ def cmd_generate_lists(ol, count=1, username=None):
 
 def cmd_populate_subjects(ol):
     """Find works missing subjects and assign them from keyword matching."""
-    print_header("Populate Subjects")
+    header("Populate Subjects")
 
     subject_data = load_json("subjects.json")
     keywords = subject_data["keywords"]
@@ -771,58 +743,70 @@ def cmd_populate_subjects(ol):
 
     # Find works without subjects
     try:
-        all_works = ol.query(type="/type/work", limit=500)
+        with spinner("Querying works…"):
+            all_works = ol.query(type="/type/work", limit=500)
     except OLError as e:
-        print(f"  Error querying works: {e}")
+        error(f"Querying works: {e}")
         return
 
     if not all_works:
-        print("  No works found. Add books first!")
+        warn("No works found. Add books first!")
         return
 
-    print(f"  Checking {len(all_works)} works for missing subjects...")
+    info(f"Checking [cyan]{len(all_works)}[/cyan] works for missing subjects…")
 
     updated = 0
     skipped = 0
     errors = 0
-    # ol.query returns Reference strings like "/works/OL1W", not dicts
-    for work_ref in all_works:
-        work_key = str(work_ref)
-        try:
-            work = ol.get(work_key)
-        except OLError:
-            continue
+    failures_shown = 0
 
-        existing_subjects = work.get("subjects", [])
-        if existing_subjects:
-            skipped += 1
-            continue
+    with step_progress() as progress:
+        task = progress.add_task("Populating subjects", total=len(all_works))
+        # ol.query returns Reference strings like "/works/OL1W", not dicts
+        for work_ref in all_works:
+            work_key = str(work_ref)
+            try:
+                work = ol.get(work_key)
+            except OLError:
+                progress.update(task, advance=1)
+                continue
 
-        # Match subjects based on title keywords
-        title = work.get("title", "").lower()
-        matched_subjects = set()
-        for keyword, subjects in keywords.items():
-            if keyword in title:
-                matched_subjects.update(subjects)
+            existing_subjects = work.get("subjects", [])
+            if existing_subjects:
+                skipped += 1
+                progress.update(task, advance=1)
+                continue
 
-        if not matched_subjects:
-            matched_subjects = set(fallback)
+            # Match subjects based on title keywords
+            title = work.get("title", "").lower()
+            matched_subjects = set()
+            for keyword, subjects in keywords.items():
+                if keyword in title:
+                    matched_subjects.update(subjects)
 
-        # Save via infobase. Use _merge_save so we don't wipe title/authors/etc.
-        patch = {
-            "key": work_key,
-            "type": {"key": "/type/work"},
-            "subjects": list(matched_subjects),
-        }
-        try:
-            _merge_save([patch], comment="shelfie: adding subjects")
-            updated += 1
-        except requests.RequestException as e:
-            errors += 1
-            if errors <= 3:
-                print(f"  Error updating {work_key}: {e}")
+            if not matched_subjects:
+                matched_subjects = set(fallback)
 
-    print(f"\n  Done! {GREEN}{updated} works updated{RESET}, {skipped} already had subjects.")
+            # Save via infobase. Use _merge_save so we don't wipe title/authors/etc.
+            patch = {
+                "key": work_key,
+                "type": {"key": "/type/work"},
+                "subjects": list(matched_subjects),
+            }
+            try:
+                _merge_save([patch], comment="shelfie: adding subjects")
+                updated += 1
+            except requests.RequestException as e:
+                errors += 1
+                if failures_shown < 3:
+                    progress.console.print(
+                        f"  [red]✗[/red] {work_key} [dim]—[/dim] {e}", highlight=False
+                    )
+                    failures_shown += 1
+            progress.update(task, advance=1)
+
+    console.print()
+    success(f"[bold]{updated}[/bold] works updated, [dim]{skipped} already had subjects.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -869,44 +853,52 @@ def _find_prod_cover_id(title, author=""):
 
 def cmd_populate_covers(ol, limit=100):
     """Find works missing covers and attach a cover_id from openlibrary.org."""
-    print_header("Populate Covers")
+    header("Populate Covers")
 
     targets = _coverless_works_from_solr(limit=limit)
     if not targets:
-        print("  No coverless works found. (If you just added books, Solr may still be indexing.)")
+        warn("No coverless works found. (If you just added books, Solr may still be indexing.)")
         return
 
-    print(f"  Found {len(targets)} coverless works. Looking up covers on openlibrary.org...")
+    info(f"Found [cyan]{len(targets)}[/cyan] coverless works. Looking up covers on openlibrary.org…")
 
     updated = 0
     no_match = 0
     errors = 0
-    total = len(targets)
+    failures_shown = 0
 
-    for done, (key, title, author) in enumerate(targets, start=1):
-        cover_id = _find_prod_cover_id(title, author)
-        if not cover_id:
-            no_match += 1
-        else:
-            patch = {
-                "key": key,
-                "type": {"key": "/type/work"},
-                "covers": [cover_id],
-            }
-            try:
-                _merge_save([patch], comment="shelfie: populating cover")
-                updated += 1
-            except requests.RequestException as e:
-                errors += 1
-                if errors <= 3:
-                    print(f"  Error updating {key}: {e}")
+    with import_progress() as progress:
+        task = progress.add_task("Populating covers", total=len(targets), ok=0, err=0)
+        for key, title, author in targets:
+            cover_id = _find_prod_cover_id(title, author)
+            if not cover_id:
+                no_match += 1
+            else:
+                patch = {
+                    "key": key,
+                    "type": {"key": "/type/work"},
+                    "covers": [cover_id],
+                }
+                try:
+                    _merge_save([patch], comment="shelfie: populating cover")
+                    updated += 1
+                except requests.RequestException as e:
+                    errors += 1
+                    if failures_shown < 3:
+                        progress.console.print(
+                            f"  [red]✗[/red] {key} [dim]—[/dim] {e}", highlight=False
+                        )
+                        failures_shown += 1
+            progress.update(task, advance=1, ok=updated, err=errors + no_match)
 
-        if done % 10 == 0 or done == total:
-            print(f"  Progress: {done}/{total} ({GREEN}updated={updated}{RESET}, no_match={no_match}, {RED}errors={errors}{RESET})")
-
-    print(f"\n  Done! {GREEN}{updated} covers added{RESET}, {no_match} no match, {RED}{errors} errors{RESET}.")
+    console.print()
+    success(
+        f"[bold]{updated}[/bold] covers added, "
+        f"[dim]{no_match} no match[/dim], "
+        f"[red]{errors}[/red] errors."
+    )
     if updated > 0:
-        print(f"  {DIM}Tip: Covers may not appear in search until Solr reindexes.{RESET}")
+        dim("Tip: covers may not appear in search until Solr reindexes.")
 
 
 # ---------------------------------------------------------------------------
@@ -945,80 +937,83 @@ def _solr_facet_count(field):
     return "?"
 
 
+def _stats_table(title, rows):
+    """Build a small two-column table of (label, value) rows."""
+    table = Table(
+        title=f"[bold cyan]{title}[/bold cyan]",
+        title_justify="left",
+        show_header=False,
+        box=SIMPLE_HEAVY,
+        pad_edge=False,
+        expand=False,
+    )
+    table.add_column(style="dim")
+    table.add_column(justify="right", style="bold")
+    for label, value in rows:
+        table.add_row(label, str(value))
+    return table
+
+
 def cmd_stats(ol):
     """Show database statistics."""
-    print_header("Database Stats")
+    header("Database Stats")
 
-    print("  Fetching counts...\n")
+    with spinner("Fetching counts…"):
+        db_counts = {
+            "Works": _infobase_count("/type/work"),
+            "Editions": _infobase_count("/type/edition"),
+            "Authors": _infobase_count("/type/author"),
+            "Users": _infobase_count("/type/user"),
+            "Lists": _infobase_count("/type/list"),
+            "Series": _infobase_count("/type/series"),
+            "Usergroups": _infobase_count("/type/usergroup"),
+        }
+        solr_counts = {
+            "Works": _solr_count("type:work"),
+            "Editions": _solr_count("type:edition"),
+            "Authors": _solr_count("type:author"),
+            "Total docs": _solr_count("*:*"),
+        }
+        works_with_covers = _solr_count("type:work AND cover_i:[* TO *]")
+        works_with_subjects = _solr_count("type:work AND subject:[* TO *]")
+        unique_subjects = _solr_facet_count("subject")
 
-    # Database counts (infobase)
-    db_counts = {
-        "Works": _infobase_count("/type/work"),
-        "Editions": _infobase_count("/type/edition"),
-        "Authors": _infobase_count("/type/author"),
-        "Users": _infobase_count("/type/user"),
-        "Lists": _infobase_count("/type/list"),
-        "Series": _infobase_count("/type/series"),
-        "Usergroups": _infobase_count("/type/usergroup"),
-    }
+    db_table = _stats_table("Database (infobase)", list(db_counts.items()))
+    solr_table = _stats_table("Search Index (Solr)", list(solr_counts.items()))
 
-    print("  Database (infobase)")
-    print("  " + "-" * 30)
-    for label, count in db_counts.items():
-        print(f"    {label:<20} {count:>6}")
-
-    # Solr counts
-    print()
-    print("  Search Index (Solr)")
-    print("  " + "-" * 30)
-    solr_counts = {
-        "Works": _solr_count("type:work"),
-        "Editions": _solr_count("type:edition"),
-        "Authors": _solr_count("type:author"),
-        "Total docs": _solr_count("*:*"),
-    }
-    for label, count in solr_counts.items():
-        print(f"    {label:<20} {count:>6}")
-
-    # Coverage stats
-    print()
-    print("  Coverage")
-    print("  " + "-" * 30)
-    works_with_covers = _solr_count("type:work AND cover_i:[* TO *]")
-    works_with_subjects = _solr_count("type:work AND subject:[* TO *]")
+    # Coverage rows include a percentage when both numbers are integers.
     total_works = solr_counts.get("Works", 0)
 
-    print(f"    {'Works with covers':<20} {works_with_covers:>6}", end="")
-    if isinstance(works_with_covers, int) and isinstance(total_works, int) and total_works > 0:
-        print(f"  ({works_with_covers * 100 // total_works}%)")
-    else:
-        print()
+    def _coverage_row(label, n):
+        if isinstance(n, int) and isinstance(total_works, int) and total_works > 0:
+            pct = n * 100 // total_works
+            return label, f"{n} ({pct}%)"
+        return label, str(n)
 
-    print(f"    {'Works with subjects':<20} {works_with_subjects:>6}", end="")
-    if isinstance(works_with_subjects, int) and isinstance(total_works, int) and total_works > 0:
-        print(f"  ({works_with_subjects * 100 // total_works}%)")
-    else:
-        print()
+    coverage_table = _stats_table(
+        "Coverage",
+        [
+            _coverage_row("Works with covers", works_with_covers),
+            _coverage_row("Works with subjects", works_with_subjects),
+            ("Unique subjects", unique_subjects),
+        ],
+    )
 
-    unique_subjects = _solr_facet_count("subject")
-    print(f"    {'Unique subjects':<20} {unique_subjects:>6}")
+    console.print(Columns([db_table, solr_table, coverage_table], padding=(0, 4), equal=False))
 
     # Sync status
-    print()
-    print("  Sync Status")
-    print("  " + "-" * 30)
     db_works = db_counts.get("Works", "?")
     solr_works = solr_counts.get("Works", "?")
     if isinstance(db_works, int) and isinstance(solr_works, int):
         unindexed = db_works - solr_works
         if unindexed > 0:
-            print(f"    {unindexed} works not yet indexed in Solr")
+            warn(f"[bold]{unindexed}[/bold] works not yet indexed in Solr")
         elif unindexed == 0:
-            print("    All works indexed in Solr")
+            success("All works indexed in Solr")
         else:
-            print(f"    Solr has {-unindexed} more works than DB (stale entries)")
+            warn(f"Solr has [bold]{-unindexed}[/bold] more works than DB (stale entries)")
     else:
-        print("    Could not compare DB and Solr counts")
+        dim("Could not compare DB and Solr counts")
 
 
 # ---------------------------------------------------------------------------
@@ -1028,7 +1023,7 @@ def cmd_stats(ol):
 
 def cmd_manage_solr(ol):
     """Manage the local Solr search index."""
-    print_header("Manage Solr Index")
+    header("Manage Solr Index")
 
     options = [
         "Check index status",
@@ -1038,19 +1033,20 @@ def cmd_manage_solr(ol):
     choice = choose("Choose action", options)
 
     if choice == "Check index status":
-        data = solr_request("/solr/openlibrary/select?q=*:*&rows=0&wt=json")
+        with spinner("Querying Solr…"):
+            data = solr_request("/solr/openlibrary/select?q=*:*&rows=0&wt=json")
+            type_counts = {}
+            if data:
+                for doc_type in ["work", "author", "edition"]:
+                    type_data = solr_request(f"/solr/openlibrary/select?q=type:{doc_type}&rows=0&wt=json")
+                    if type_data:
+                        type_counts[doc_type] = type_data.get("response", {}).get("numFound", "?")
         if data:
             num_docs = data.get("response", {}).get("numFound", "?")
-            print(f"  Total documents in Solr: {num_docs}")
-
-            # Break down by type
-            for doc_type in ["work", "author", "edition"]:
-                type_data = solr_request(f"/solr/openlibrary/select?q=type:{doc_type}&rows=0&wt=json")
-                if type_data:
-                    n = type_data.get("response", {}).get("numFound", "?")
-                    print(f"    {doc_type}s: {n}")
+            rows = [("Total documents", num_docs)] + [(f"{t}s", n) for t, n in type_counts.items()]
+            console.print(_stats_table("Solr Index", rows))
         else:
-            print("  Could not connect to Solr at solr:8983")
+            error("Could not connect to Solr at solr:8983")
 
     elif choice == "Reindex specific works":
         raw = ask("Enter work keys (comma-separated, e.g. /works/OL1W,/works/OL2W)")
@@ -1059,13 +1055,10 @@ def cmd_manage_solr(ol):
         keys = [k.strip() for k in raw.split(",") if k.strip()]
         for key in keys:
             try:
-                ol._request(
-                    f"/admin/solr/update?key={key}",
-                    method="GET",
-                )
-                print(f"  Reindex requested for {key}")
+                ol._request(f"/admin/solr/update?key={key}", method="GET")
+                success(f"Reindex requested for [cyan]{key}[/cyan]")
             except OLError as e:
-                print(f"  Error reindexing {key}: {e}")
+                error(f"Reindexing {key}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1116,39 +1109,35 @@ def _guess_password(username):
 
 def cmd_list_users(ol):
     """List all users in the local DB with emails, roles, and password hints."""
-    print_header("Users")
+    header("Users")
 
     user_keys = _infobase_keys_of_type("/type/user")
     if not user_keys:
-        print("  No users found.")
+        warn("No users found.")
         return
 
     roles_by_user = _get_user_roles_map()
 
-    rows = []
+    table = Table(box=SIMPLE_HEAVY, header_style="bold cyan", expand=False)
+    table.add_column("Username", style="bold")
+    table.add_column("Email", style="cyan")
+    table.add_column("Roles", style="yellow")
+    table.add_column("Password")
+
     for key in sorted(user_keys):
         username = key.rsplit("/", 1)[-1]
         account = _infobase_find_account(username) or {}
         email = account.get("email", "")
         roles = roles_by_user.get(key, [])
-        pwd = _guess_password(username) or "(hashed)"
-        rows.append((username, email, ", ".join(roles) or "-", pwd))
+        pwd = _guess_password(username)
+        pwd_cell = pwd if pwd else "[dim](hashed)[/dim]"
+        table.add_row(username, email, ", ".join(roles) or "[dim]-[/dim]", pwd_cell)
 
-    headers = ("Username", "Email", "Roles", "Password")
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-
-    def fmt(cells):
-        return "  " + "  ".join(c.ljust(w) for c, w in zip(cells, widths))
-
-    print(fmt(headers))
-    print("  " + "-" * (sum(widths) + 2 * (len(widths) - 1)))
-    for row in rows:
-        print(fmt(row))
-
-    print()
-    print(f"  {DIM}Passwords are stored as salted hashes and cannot be recovered.")
-    print(f"  Shown values are shelfie defaults - '(hashed)' means unknown.{RESET}")
-    print(f"  {GREEN}{len(rows)} user(s) found.{RESET}")
+    console.print(table)
+    console.print()
+    dim("Passwords are stored as salted hashes and cannot be recovered.")
+    dim("Shown values are shelfie defaults — '(hashed)' means unknown.")
+    success(f"[bold]{len(user_keys)}[/bold] user(s) found.")
 
 
 # ---------------------------------------------------------------------------
@@ -1158,19 +1147,19 @@ def cmd_list_users(ol):
 
 def cmd_seed_ratings(ol, count=10, username=None):
     """Add ratings to existing books."""
-    print_header("Seed Reviews & Ratings")
+    header("Seed Reviews & Ratings")
 
     work_keys = get_work_keys(ol, limit=200)
 
     if not work_keys:
-        print("  No works found. Add books first!")
+        warn("No works found. Add books first!")
         return
 
     if not username:
         username = ask("Username to rate as", DEFAULT_USERNAME)
-    print(f"  Will add {count} ratings as '{username}' across {len(work_keys)} works.")
+    info(f"Will add [cyan]{count}[/cyan] ratings as '[cyan]{username}[/cyan]' across {len(work_keys)} works.")
 
-    success = 0
+    succeeded = 0
     selected_works = random.choices(work_keys, k=min(count, len(work_keys)))
 
     for work_key in selected_works:
@@ -1186,12 +1175,14 @@ def cmd_seed_ratings(ol, count=10, username=None):
                 method="POST",
                 data={"rating": str(rating), "edition_id": "", "ajax": "true"},
             )
-            print(f"  Rated {work_key}: {'*' * rating}")
-            success += 1
+            stars = "[yellow]" + "★" * rating + "[/yellow][dim]" + "☆" * (5 - rating) + "[/dim]"
+            console.print(f"  {stars}  [cyan]{work_key}[/cyan]", highlight=False)
+            succeeded += 1
         except (OLError, requests.RequestException, json.JSONDecodeError) as e:
-            print(f"  Error rating {work_key}: {e}")
+            error(f"Rating {work_key}: {e}")
 
-    print(f"\n  Done! {GREEN}{success}/{len(selected_works)} ratings added.{RESET}")
+    console.print()
+    success(f"[bold]{succeeded}/{len(selected_works)}[/bold] ratings added.")
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1192,7 @@ def cmd_seed_ratings(ol, count=10, username=None):
 
 def cmd_seed_reading_log(ol, count=20, username=None):
     """Add books to a user's reading shelves."""
-    print_header("Seed Reading Log")
+    header("Seed Reading Log")
 
     if not username:
         username = ask("Username", DEFAULT_USERNAME)
@@ -1209,45 +1200,46 @@ def cmd_seed_reading_log(ol, count=20, username=None):
     work_keys = get_work_keys(ol, limit=500)
 
     if not work_keys:
-        print("  No works found. Add books first!")
+        warn("No works found. Add books first!")
         return
 
     available = min(count, len(work_keys))
     selected = random.sample(work_keys, available)
-    print(f"  Adding {available} books to reading shelves for '{username}'...")
+    info(f"Adding [cyan]{available}[/cyan] books to reading shelves for '[cyan]{username}[/cyan]'…")
 
-    success = 0
-    for i, work_key in enumerate(selected):
-        r = random.random()
-        if r < 0.3:
-            shelf_id = 1
-        elif r < 0.5:
-            shelf_id = 2
-        else:
-            shelf_id = 3
+    succeeded = 0
+    with step_progress() as progress:
+        task = progress.add_task("Shelving books", total=available)
+        for work_key in selected:
+            r = random.random()
+            if r < 0.3:
+                shelf_id = 1
+            elif r < 0.5:
+                shelf_id = 2
+            else:
+                shelf_id = 3
 
-        # Extract work ID (e.g., /works/OL123W -> OL123W)
-        work_id = work_key.split("/")[-1]
+            # Extract work ID (e.g., /works/OL123W -> OL123W)
+            work_id = work_key.split("/")[-1]
 
-        try:
-            ol._request(
-                f"/works/{work_id}/bookshelves.json",
-                method="POST",
-                params={"bookshelf_id": str(shelf_id), "action": "add"},
-            )
-            success += 1
-        except (OLError, requests.RequestException) as e:
-            if success == 0:
-                print(f"  Error: {e}")
-                return
+            try:
+                ol._request(
+                    f"/works/{work_id}/bookshelves.json",
+                    method="POST",
+                    params={"bookshelf_id": str(shelf_id), "action": "add"},
+                )
+                succeeded += 1
+            except (OLError, requests.RequestException) as e:
+                if succeeded == 0:
+                    progress.stop()
+                    error(f"{e}")
+                    return
 
-        done = i + 1
-        if done % 10 == 0 or done == available:
-            print(f"  Progress: {done}/{available}")
+            progress.update(task, advance=1)
 
-    # Show distribution
-    print(f"\n  Done! {GREEN}{success} books added to reading log.{RESET}")
-    print("  Distributed across: Want to Read, Currently Reading, Already Read")
+    console.print()
+    success(f"[bold]{succeeded}[/bold] books added to reading log.")
+    dim("Distributed across: Want to Read · Currently Reading · Already Read")
 
 
 # ---------------------------------------------------------------------------
@@ -1385,9 +1377,9 @@ def _fetch_series_works(series_def):
 
 def cmd_seed_series(ol, count=3):
     """Create real book series from openlibrary.org."""
-    print_header("Seed Series")
+    header("Seed Series")
 
-    print("  Fetching real series data from openlibrary.org...")
+    info("Fetching real series data from openlibrary.org…")
 
     # Find the next available series key
     try:
@@ -1408,29 +1400,31 @@ def cmd_seed_series(ol, count=3):
     series_pool = REAL_SERIES.copy()
     random.shuffle(series_pool)
 
-    success = 0
+    succeeded = 0
     for i in range(min(count, len(series_pool))):
         series_def = series_pool[i]
         series_name = series_def["name"]
 
-        works = _fetch_series_works(series_def)
+        with spinner(f"Searching '{series_name}'…"):
+            works = _fetch_series_works(series_def)
         if len(works) < 2:
-            print(f"  Skipping '{series_name}': not enough works found online")
+            warn(f"Skipping '[cyan]{series_name}[/cyan]': not enough works found online")
             continue
 
         imported_work_keys = []
-        for doc in works:
-            record = _search_doc_to_record(doc, f"shelfie:series-{doc.get('key', '')}")
-            work_key = _import_and_get_work_key(ol, record)
-            if work_key:
-                imported_work_keys.append(work_key)
+        with spinner(f"Importing {len(works)} works for '{series_name}'…"):
+            for doc in works:
+                record = _search_doc_to_record(doc, f"shelfie:series-{doc.get('key', '')}")
+                work_key = _import_and_get_work_key(ol, record)
+                if work_key:
+                    imported_work_keys.append(work_key)
 
         if len(imported_work_keys) < 2:
-            print(f"  Skipping '{series_name}': could not import enough works")
+            warn(f"Skipping '[cyan]{series_name}[/cyan]': could not import enough works")
             continue
 
         # Create the series and link works
-        series_key = f"/series/OL{max_id + success + 1}L"
+        series_key = f"/series/OL{max_id + succeeded + 1}L"
         series_doc = {
             "key": series_key,
             "type": {"key": "/type/series"},
@@ -1441,7 +1435,7 @@ def cmd_seed_series(ol, count=3):
         try:
             infobase_save([series_doc], comment=f"shelfie: creating series '{series_name}'")
         except requests.RequestException as e:
-            print(f"  Error creating series '{series_name}': {e}")
+            error(f"Creating series '[cyan]{series_name}[/cyan]': {e}")
             continue
 
         work_patches = [
@@ -1458,13 +1452,16 @@ def cmd_seed_series(ol, count=3):
                 comment=f"shelfie: linking works to series '{series_name}'",
             )
 
-        print(f"  Created: {series_name} ({series_key}) with {len(imported_work_keys)} works")
+        success(
+            f"Created [cyan]{series_name}[/cyan] [dim]({series_key})[/dim] with {len(imported_work_keys)} works"
+        )
         titles = [w["title"] for w in works[: len(imported_work_keys)]]
         for pos, title in enumerate(titles, 1):
-            print(f"    {pos}. {title}")
-        success += 1
+            console.print(f"    [dim]{pos}.[/dim] {title}", highlight=False)
+        succeeded += 1
 
-    print(f"\n  Done! {GREEN}{success}/{count} series created.{RESET}")
+    console.print()
+    success(f"[bold]{succeeded}/{count}[/bold] series created.")
 
 
 # ---------------------------------------------------------------------------
@@ -1474,37 +1471,31 @@ def cmd_seed_series(ol, count=3):
 
 def cmd_populate_all(ol):
     """Run all seeding operations to get a rich local dev database."""
-    print_header("Populate Everything")
-    print("  This will seed your local DB with a rich set of test data:")
-    print("    - 100 books from openlibrary.org (with covers)")
-    print("    - Subjects on all works")
-    print("    - 5 reading lists")
-    print("    - 30 ratings")
-    print("    - 20 books on reading shelves")
-    print("    - 3 series with ordered works")
-    print()
+    header("Populate Everything")
+    plain("This will seed your local DB with a rich set of test data:")
+    plain("  • 100 books from openlibrary.org (with covers)")
+    plain("  • Subjects on all works")
+    plain("  • 5 reading lists")
+    plain("  • 30 ratings")
+    plain("  • 20 books on reading shelves")
+    plain("  • 3 series with ordered works")
+    console.print()
 
-    if not confirm("  Proceed?"):
-        print("  Cancelled.")
+    if not confirm("Proceed?"):
+        warn("Cancelled.")
         return
 
-    print()
     cmd_add_books(ol, count=100, source="production")
-    print()
     cmd_populate_subjects(ol)
-    print()
     cmd_generate_lists(ol, count=5, username=DEFAULT_USERNAME)
-    print()
     cmd_seed_ratings(ol, count=30, username=DEFAULT_USERNAME)
-    print()
     cmd_seed_reading_log(ol, count=20, username=DEFAULT_USERNAME)
-    print()
     cmd_seed_series(ol, count=3)
 
-    print()
-    print_header("All Done!")
-    print("  Your local DB is now populated with rich test data.")
-    print("  Run 'Stats' to see the current state.")
+    console.print()
+    header("All Done!")
+    plain("Your local DB is now populated with rich test data.")
+    plain("Run 'Stats' to see the current state.")
 
 
 # ---------------------------------------------------------------------------
@@ -1539,16 +1530,16 @@ def _delete_keys(keys, comment):
             infobase_save(batch, comment=comment)
             deleted += len(batch)
         except requests.RequestException as e:
-            print(f"  {RED}Error deleting batch: {e}{RESET}")
+            error(f"Deleting batch: {e}")
     return deleted
 
 
 def cmd_reset_state(ol):
     """Clear shelfie-created data from local database."""
-    print_header("Reset Local State")
-    print(f"  {YELLOW}WARNING: This will delete data from your local dev database.{RESET}")
-    print("  This does NOT affect production.")
-    print()
+    header("Reset Local State")
+    warn("This will delete data from your local dev database.")
+    dim("This does NOT affect production.")
+    console.print()
 
     options = [
         "Delete shelfie-imported books (editions, works, authors)",
@@ -1561,45 +1552,48 @@ def cmd_reset_state(ol):
     choice = choose("What to reset?", options)
 
     if choice == options[5]:  # Cancel
-        print("  Cancelled.")
+        warn("Cancelled.")
         return
 
     if choice == options[4]:  # Nuclear
-        print()
-        print("  To fully reset, run:")
-        print(f"    {BOLD}docker compose down -v && docker compose up{RESET}")
+        console.print()
+        plain("To fully reset, run:")
+        console.print("  [bold cyan]docker compose down -v && docker compose up[/bold cyan]")
         return
 
     targets = {}
 
     if choice in (options[0], options[3]):  # Books or everything
-        editions = _infobase_keys_of_type("/type/edition")
-        works = _infobase_keys_of_type("/type/work")
-        authors = _infobase_keys_of_type("/type/author")
+        with spinner("Listing editions, works, authors…"):
+            editions = _infobase_keys_of_type("/type/edition")
+            works = _infobase_keys_of_type("/type/work")
+            authors = _infobase_keys_of_type("/type/author")
         targets["editions"] = editions
         targets["works"] = works
         targets["authors"] = authors
 
     if choice in (options[1], options[3]):  # Series or everything
-        series = _infobase_keys_of_type("/type/series")
+        with spinner("Listing series…"):
+            series = _infobase_keys_of_type("/type/series")
         targets["series"] = series
 
     if choice in (options[2], options[3]):  # Lists or everything
-        lists = _infobase_keys_of_type("/type/list")
+        with spinner("Listing lists…"):
+            lists = _infobase_keys_of_type("/type/list")
         targets["lists"] = lists
 
     total = sum(len(v) for v in targets.values())
     if total == 0:
-        print("  Nothing to delete.")
+        info("Nothing to delete.")
         return
 
-    print()
+    console.print()
     for label, keys in targets.items():
-        print(f"    {label}: {len(keys)}")
-    print()
+        console.print(f"  [dim]{label}:[/dim] [bold]{len(keys)}[/bold]", highlight=False)
+    console.print()
 
-    if not confirm(f"  Delete {total} documents?"):
-        print("  Cancelled.")
+    if not confirm(f"Delete {total} documents?"):
+        warn("Cancelled.")
         return
 
     # Delete in dependency order: editions before works, works before authors
@@ -1608,11 +1602,13 @@ def cmd_reset_state(ol):
     for label in delete_order:
         keys = targets.get(label, [])
         if keys:
-            deleted = _delete_keys(keys, comment=f"shelfie: reset {label}")
+            with spinner(f"Deleting {len(keys)} {label}…"):
+                deleted = _delete_keys(keys, comment=f"shelfie: reset {label}")
             total_deleted += deleted
-            print(f"  Deleted {GREEN}{deleted}{RESET} {label}.")
+            success(f"Deleted [bold]{deleted}[/bold] {label}.")
 
-    print(f"\n  Done! {GREEN}{total_deleted} documents deleted.{RESET}")
+    console.print()
+    success(f"[bold]{total_deleted}[/bold] documents deleted.")
 
 
 # ---------------------------------------------------------------------------
@@ -1627,16 +1623,19 @@ def cmd_smoke_test(ol):
     review (PR #12157). Run after edits to cli.py to catch regressions.
     Requires a fresh dev DB (or at least the default `admin` user).
     """
-    print_header("Smoke Test")
+    header("Smoke Test")
 
     failures = []
 
     def _check(name, cond, detail=""):
         if cond:
-            print(f"  {GREEN}PASS{RESET}  {name}")
+            console.print(f"  [green bold]PASS[/green bold]  {name}", highlight=False)
         else:
-            print(f"  {RED}FAIL{RESET}  {name}: {detail}")
+            console.print(f"  [red bold]FAIL[/red bold]  {name}: {detail}", highlight=False)
             failures.append(name)
+
+    def _skip(name):
+        console.print(f"  [yellow bold]SKIP[/yellow bold]  {name}", highlight=False)
 
     # --- Bug #3: generate-lists with a bogus username must not crash ---
     try:
@@ -1690,7 +1689,7 @@ def cmd_smoke_test(ol):
             f"no subjects on {target_key} after run",
         )
     else:
-        print(f"  {YELLOW}SKIP{RESET}  populate-subjects checks (no eligible work)")
+        _skip("populate-subjects checks (no eligible work)")
 
     # --- Bug #4: seed-ratings must actually record ratings ---
     username = DEFAULT_USERNAME
@@ -1708,7 +1707,7 @@ def cmd_smoke_test(ol):
             "could not query solr",
         )
     else:
-        print(f"  {YELLOW}SKIP{RESET}  seed-ratings checks (no '{username}' user)")
+        _skip(f"seed-ratings checks (no '{username}' user)")
 
     # --- Bug #5 (series): series link must not wipe work title ---
     # Only runs if we have enough imports already; otherwise skipped.
@@ -1736,13 +1735,13 @@ def cmd_smoke_test(ol):
             f"title on {existing_work}: {existing_title!r} -> {after.get('title')!r}",
         )
 
-    print()
+    console.print()
     if failures:
-        print(f"  {RED}{len(failures)} failure(s):{RESET}")
+        error(f"[bold]{len(failures)}[/bold] failure(s):")
         for f in failures:
-            print(f"    - {f}")
+            plain(f"    - {f}")
         return 1
-    print(f"  {GREEN}All smoke tests passed.{RESET}")
+    success("All smoke tests passed.")
     return 0
 
 
@@ -1770,98 +1769,96 @@ MENU_OPTIONS = [
 ]
 
 
-BOLD = "\033[1m"
-RESET = "\033[0m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-YELLOW = "\033[33m"
-LOGO = f"""
-{BOLD}   ____  _          _  __ _
-  / ___|| |__   ___| |/ _(_) ___
-  \\___ \\| '_ \\ / _ \\ | |_| |/ _ \\
-   ___) | | | |  __/ |  _| |  __/
-  |____/|_| |_|\\___|_|_| |_|\\___|
-{RESET}
-  Open Library Dev Tool
-"""
+# Maps menu labels to the callable that runs them. Each handler takes `ol`
+# and is responsible for any further prompts.
+def _menu_dispatch():
+    return {
+        "Populate everything": lambda ol: cmd_populate_all(ol),
+        "Add books": _menu_add_books,
+        "Generate lists": _menu_generate_lists,
+        "Seed reading log": _menu_seed_reading_log,
+        "Seed series": _menu_seed_series,
+        "Seed reviews & ratings": _menu_seed_ratings,
+        "Populate subjects on existing books": lambda ol: cmd_populate_subjects(ol),
+        "Populate covers on existing books": _menu_populate_covers,
+        "Change user role": lambda ol: cmd_set_role(ol),
+        "List users": lambda ol: cmd_list_users(ol),
+        "Manage Solr index": lambda ol: cmd_manage_solr(ol),
+        "Stats": lambda ol: cmd_stats(ol),
+        "Smoke test": lambda ol: cmd_smoke_test(ol),
+        "Reset local state": lambda ol: cmd_reset_state(ol),
+    }
 
 
-DIM = "\033[2m"
+def _menu_add_books(ol):
+    count_choice = choose("How many books?", ["10", "100", "1000"])
+    source_choice = choose("Source?", ["Production (openlibrary.org)", "Seed data (offline)"])
+    source = "production" if "Production" in source_choice else "seed"
+    cmd_add_books(ol, count=int(count_choice), source=source)
 
 
-def _print_startup_stats():
-    """Print a compact stats summary below the logo."""
-    works = _infobase_count("/type/work")
-    editions = _infobase_count("/type/edition")
-    authors = _infobase_count("/type/author")
-    lists = _infobase_count("/type/list")
-    series = _infobase_count("/type/series")
-    users = _infobase_count("/type/user")
-    covers = _solr_count("type:work AND cover_i:[* TO *]")
-    subjects = _solr_facet_count("subject")
+def _menu_generate_lists(ol):
+    count_choice = choose("How many lists?", ["1", "5", "10"])
+    cmd_generate_lists(ol, count=int(count_choice))
 
-    def fmt(n):
-        return str(n) if isinstance(n, int) else "?"
 
-    print(f"  {DIM}works: {fmt(works)}  editions: {fmt(editions)}  authors: {fmt(authors)}  covers: {fmt(covers)}")
-    print(f"  lists: {fmt(lists)}  series: {fmt(series)}  subjects: {fmt(subjects)}  users: {fmt(users)}{RESET}")
+def _menu_seed_reading_log(ol):
+    count_choice = choose("How many books to shelve?", ["10", "20", "50"])
+    cmd_seed_reading_log(ol, count=int(count_choice))
+
+
+def _menu_seed_series(ol):
+    count_choice = choose("How many series?", ["1", "3", "5"])
+    cmd_seed_series(ol, count=int(count_choice))
+
+
+def _menu_seed_ratings(ol):
+    count_choice = choose("How many ratings?", ["10", "50", "100"])
+    cmd_seed_ratings(ol, count=int(count_choice))
+
+
+def _menu_populate_covers(ol):
+    limit_choice = choose("How many to look up?", ["50", "100", "500"])
+    cmd_populate_covers(ol, limit=int(limit_choice))
+
+
+def _compute_startup_stats():
+    """Return [(label, value)] pairs for the banner stats panel."""
+    return [
+        ("works", _infobase_count("/type/work")),
+        ("editions", _infobase_count("/type/edition")),
+        ("authors", _infobase_count("/type/author")),
+        ("covers", _solr_count("type:work AND cover_i:[* TO *]")),
+        ("lists", _infobase_count("/type/list")),
+        ("series", _infobase_count("/type/series")),
+        ("subjects", _solr_facet_count("subject")),
+        ("users", _infobase_count("/type/user")),
+    ]
 
 
 def interactive_menu():
     """Main interactive menu loop."""
-    print(LOGO)
-    print(f"  Server: {DEFAULT_BASE_URL}")
-    _print_startup_stats()
-    print()
+    with spinner("Loading database stats…"):
+        stats = _compute_startup_stats()
+    banner(DEFAULT_BASE_URL, stats)
 
     ol = connect()
 
+    dispatch = _menu_dispatch()
     while True:
         try:
-            print()
+            console.print()
             choice = choose("Choose an option", MENU_OPTIONS)
 
             if choice == "Exit":
-                print("  Bye!")
+                dim("Bye!")
                 break
-            elif choice == "Populate everything":
-                cmd_populate_all(ol)
-            elif choice == "Add books":
-                count_choice = choose("How many books?", ["10", "100", "1000"])
-                source_choice = choose("Source?", ["Production (openlibrary.org)", "Seed data (offline)"])
-                source = "production" if "Production" in source_choice else "seed"
-                cmd_add_books(ol, count=int(count_choice), source=source)
-            elif choice == "Generate lists":
-                count_choice = choose("How many lists?", ["1", "5", "10"])
-                cmd_generate_lists(ol, count=int(count_choice))
-            elif choice == "Seed reading log":
-                count_choice = choose("How many books to shelve?", ["10", "20", "50"])
-                cmd_seed_reading_log(ol, count=int(count_choice))
-            elif choice == "Seed series":
-                count_choice = choose("How many series?", ["1", "3", "5"])
-                cmd_seed_series(ol, count=int(count_choice))
-            elif choice == "Seed reviews & ratings":
-                count_choice = choose("How many ratings?", ["10", "50", "100"])
-                cmd_seed_ratings(ol, count=int(count_choice))
-            elif choice == "Populate subjects on existing books":
-                cmd_populate_subjects(ol)
-            elif choice == "Populate covers on existing books":
-                limit_choice = choose("How many to look up?", ["50", "100", "500"])
-                cmd_populate_covers(ol, limit=int(limit_choice))
-            elif choice == "Change user role":
-                cmd_set_role(ol)
-            elif choice == "List users":
-                cmd_list_users(ol)
-            elif choice == "Manage Solr index":
-                cmd_manage_solr(ol)
-            elif choice == "Stats":
-                cmd_stats(ol)
-            elif choice == "Smoke test":
-                cmd_smoke_test(ol)
-            elif choice == "Reset local state":
-                cmd_reset_state(ol)
+            handler = dispatch.get(choice)
+            if handler:
+                handler(ol)
         except UserExit:
-            print("\n  Bye!")
+            console.print()
+            dim("Bye!")
             break
 
 

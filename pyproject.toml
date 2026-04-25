@@ -12,6 +12,8 @@ license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "Lokesh Dhakar" }]
 dependencies = [
     "requests>=2.31",
+    "rich>=13.7",
+    "questionary>=2.0",
 ]
 
 [project.optional-dependencies]
