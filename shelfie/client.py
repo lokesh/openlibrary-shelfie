@@ -33,9 +33,17 @@ class OLError(Exception):
 
 
 class OLClient:
-    def __init__(self, base_url="https://openlibrary.org"):
+    DEFAULT_TIMEOUT = 30
+
+    def __init__(self, base_url="https://openlibrary.org", timeout=DEFAULT_TIMEOUT):
         self.base_url = base_url.rstrip("/") if base_url else "https://openlibrary.org"
+        self.timeout = timeout
         self.cookie = None
+        # Reused across calls so keep-alive connections stick — meaningful for
+        # the parallel `/api/import` path. Auth lives on `self.cookie` and is
+        # set explicitly on each request, so the session's auto-captured jar
+        # is cleared per call to keep the explicit header authoritative.
+        self._session = requests.Session()
 
     def _request(
         self,
@@ -53,18 +61,21 @@ class OLClient:
             headers["Cookie"] = self.cookie
 
         try:
-            response = requests.request(
+            response = self._session.request(
                 method,
                 url,
                 data=data,
                 headers=headers,
                 params=params,
                 allow_redirects=allow_redirects,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             return response
         except requests.HTTPError as e:
             raise OLError(e)
+        finally:
+            self._session.cookies.clear()
 
     def login(self, username, password):
         """POST /account/login. OL reads credentials from query params, not

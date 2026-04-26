@@ -233,14 +233,19 @@ def _user_exists(ol, username):
 
 
 def solr_request(path, base_url=None):
-    """Make a request to the local Solr instance."""
+    """Make a request to the local Solr instance.
+
+    Returns parsed JSON, or None on any failure. Callers handle None
+    (stats render "?", coverless lookup returns []). We don't print here:
+    the startup banner alone fans 8 calls, so a flaky Solr would otherwise
+    spam the same red error 8 times before the menu draws.
+    """
     solr_url = (base_url or "http://solr:8983") + path
     try:
         resp = requests.get(solr_url, timeout=10)
         resp.raise_for_status()
         return resp.json()
-    except (requests.RequestException, ValueError, KeyError) as e:
-        error(f"Solr error: {e}")
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -1178,14 +1183,19 @@ def cmd_seed_ratings(ol, count=10, username=None):
     """Add ratings to existing books."""
     header("Seed Reviews & Ratings")
 
+    if not username:
+        username = ask("Username to rate as", DEFAULT_USERNAME)
+
+    if not _user_exists(ol, username):
+        error(f"User '[cyan]/people/{username}[/cyan]' not found. Create the user first.")
+        return
+
     work_keys = get_work_keys(ol, limit=200)
 
     if not work_keys:
         warn("No works found. Add books first!")
         return
 
-    if not username:
-        username = ask("Username to rate as", DEFAULT_USERNAME)
     info(f"Will add [cyan]{count}[/cyan] ratings as '[cyan]{username}[/cyan]' across {len(work_keys)} works.")
 
     succeeded = 0
@@ -2059,53 +2069,52 @@ def build_parser():
     return parser
 
 
+# Maps subcommand name to the callable that runs it. Mirrors _MENU_DISPATCH
+# so adding a feature is a one-place edit on each side. health-check and
+# smoke-test stay special-cased in main() — they own their own exit code
+# and (for health-check) bypass connect()/the Docker preflight.
+_CMD_DISPATCH = {
+    "add-books": lambda ol, args: cmd_add_books(ol, count=args.count, source=args.source),
+    "set-role": lambda ol, args: cmd_set_role(ol, username=args.username, role=args.role, action=args.action),
+    "generate-lists": lambda ol, args: cmd_generate_lists(ol, count=args.count, username=args.username),
+    "populate-subjects": lambda ol, args: cmd_populate_subjects(ol),
+    "populate-covers": lambda ol, args: cmd_populate_covers(ol, limit=args.limit),
+    "stats": lambda ol, args: cmd_stats(ol),
+    "manage-solr": lambda ol, args: cmd_manage_solr(ol),
+    "list-users": lambda ol, args: cmd_list_users(ol),
+    "seed-ratings": lambda ol, args: cmd_seed_ratings(ol, count=args.count, username=args.username),
+    "seed-reading-log": lambda ol, args: cmd_seed_reading_log(ol, count=args.count, username=args.username),
+    "seed-series": lambda ol, args: cmd_seed_series(ol, count=args.count),
+    "populate-all": lambda ol, args: cmd_populate_all(ol),
+    "reset": lambda ol, args: cmd_reset_state(ol),
+}
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    cmd = args.command
 
     # health-check runs its own login as a measured step — skip auto-connect.
     # We also skip the Docker preflight here: health-check is the right tool
     # to *diagnose* exactly the situation the preflight catches.
-    if args.command == "health-check":
+    if cmd == "health-check":
         raise SystemExit(cmd_health_check(args.url, args.email, args.password))
 
     _preflight_docker_check(args.url)
 
     # No subcommand = interactive mode
-    if not args.command:
+    if not cmd:
         interactive_menu()
         return
 
     ol = connect(args.url, args.email, args.password)
 
-    if args.command == "add-books":
-        cmd_add_books(ol, count=args.count, source=args.source)
-    elif args.command == "set-role":
-        cmd_set_role(ol, username=args.username, role=args.role, action=args.action)
-    elif args.command == "generate-lists":
-        cmd_generate_lists(ol, count=args.count, username=args.username)
-    elif args.command == "populate-subjects":
-        cmd_populate_subjects(ol)
-    elif args.command == "populate-covers":
-        cmd_populate_covers(ol, limit=args.limit)
-    elif args.command == "stats":
-        cmd_stats(ol)
-    elif args.command == "manage-solr":
-        cmd_manage_solr(ol)
-    elif args.command == "list-users":
-        cmd_list_users(ol)
-    elif args.command == "seed-ratings":
-        cmd_seed_ratings(ol, count=args.count, username=args.username)
-    elif args.command == "seed-reading-log":
-        cmd_seed_reading_log(ol, count=args.count, username=args.username)
-    elif args.command == "seed-series":
-        cmd_seed_series(ol, count=args.count)
-    elif args.command == "populate-all":
-        cmd_populate_all(ol)
-    elif args.command == "reset":
-        cmd_reset_state(ol)
-    elif args.command == "smoke-test":
+    # smoke-test returns an exit code for CI; everything else returns None.
+    if cmd == "smoke-test":
         raise SystemExit(cmd_smoke_test(ol))
+
+    _CMD_DISPATCH[cmd](ol, args)
 
 
 if __name__ == "__main__":
