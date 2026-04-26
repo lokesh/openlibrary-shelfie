@@ -13,6 +13,7 @@ from rich.box import SIMPLE_HEAVY
 from rich.columns import Columns
 from rich.console import Console
 from rich.padding import Padding
+from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     Progress,
@@ -152,6 +153,84 @@ def stats_table(title, rows):
     for label, value in rows:
         table.add_row(label, str(value))
     return table
+
+
+def truncate_title(title, n=40):
+    """Trim a book title for display in narrow progress columns."""
+    title = (title or "").strip()
+    return title if len(title) <= n else title[: n - 1] + "…"
+
+
+def _fmt_count(v):
+    """Format a stat value: comma-separated int, or pass-through (e.g. '?')."""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, int):
+        return f"{v:,}"
+    return str(v)
+
+
+def _fmt_delta(before, after):
+    """Render a delta cell: +N (green) / -N (red) / em-dash if no change
+    or non-numeric."""
+    try:
+        diff = int(after) - int(before)
+    except (TypeError, ValueError):
+        return "[dim]—[/dim]"
+    if diff > 0:
+        return f"[green]+{diff:,}[/green]"
+    if diff < 0:
+        return f"[red]{diff:,}[/red]"
+    return "[dim]—[/dim]"
+
+
+def _fmt_duration(seconds):
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+def summary_panel(title, before, after, elapsed=None):
+    """Render a recap panel comparing before/after stats with deltas.
+
+    `before` and `after` are list[(label, value)] in matching order. Used
+    after multi-step ops (populate-all) so the user can see at a glance
+    what actually changed.
+    """
+    before_map = dict(before)
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim")          # label
+    table.add_column(justify="right")      # before
+    table.add_column(style="dim")          # arrow
+    table.add_column(justify="right")      # after
+    table.add_column()                     # delta
+
+    for label, after_val in after:
+        before_val = before_map.get(label, "—")
+        table.add_row(
+            label,
+            f"[dim]{_fmt_count(before_val)}[/dim]",
+            "→",
+            f"[bold cyan]{_fmt_count(after_val)}[/bold cyan]",
+            _fmt_delta(before_val, after_val),
+        )
+
+    panel_title = title
+    if elapsed is not None:
+        panel_title = f"{title} [dim](in {_fmt_duration(elapsed)})[/dim]"
+
+    return Panel(
+        table,
+        title=panel_title,
+        title_align="left",
+        border_style="cyan",
+        padding=(1, 2),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +430,8 @@ def spinner(message):
 
 
 def import_progress():
-    """Progress factory for parallel imports — tracks ok/err counters."""
+    """Progress factory for parallel imports — tracks ok/err counters
+    and shows the most recently completed title in a dim trailing column."""
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold]{task.description}"),
@@ -361,6 +441,7 @@ def import_progress():
             "[green]✓ {task.fields[ok]:>3}[/green]  [red]✗ {task.fields[err]:>3}[/red]"
         ),
         TimeElapsedColumn(),
+        TextColumn("[dim italic]{task.fields[current]}[/dim italic]"),
         console=console,
         transient=False,
     )
@@ -409,6 +490,8 @@ __all__ = [
     "header",
     "banner",
     "stats_table",
+    "summary_panel",
+    "truncate_title",
     "success",
     "info",
     "warn",

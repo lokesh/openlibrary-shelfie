@@ -72,6 +72,7 @@ import argparse
 import contextlib
 import json
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -101,6 +102,8 @@ from .ui import (
     stats_table,
     step_progress,
     success,
+    summary_panel,
+    truncate_title,
     warn,
 )
 
@@ -439,7 +442,9 @@ def _import_books(ol, records, workers=IMPORT_WORKERS):
     total = len(records)
 
     with import_progress() as progress:
-        task = progress.add_task("Importing books", total=total, ok=0, err=0)
+        task = progress.add_task(
+            "Importing books", total=total, ok=0, err=0, current=""
+        )
         log_failure = failure_logger(progress)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_import_one_book, ol, r): r for r in records}
@@ -451,7 +456,13 @@ def _import_books(ol, records, workers=IMPORT_WORKERS):
                 else:
                     errors += 1
                     log_failure(record["title"], err_msg)
-                progress.update(task, advance=1, ok=success_count, err=errors)
+                progress.update(
+                    task,
+                    advance=1,
+                    ok=success_count,
+                    err=errors,
+                    current=truncate_title(record["title"]),
+                )
 
     return success_count, errors
 
@@ -910,7 +921,9 @@ def cmd_populate_covers(ol, limit=100):
     errors = 0
 
     with import_progress() as progress:
-        task = progress.add_task("Populating covers", total=len(targets), ok=0, err=0)
+        task = progress.add_task(
+            "Populating covers", total=len(targets), ok=0, err=0, current=""
+        )
         log_failure = failure_logger(progress)
         for key, title, author in targets:
             cover_id = _find_prod_cover_id(title, author)
@@ -928,7 +941,13 @@ def cmd_populate_covers(ol, limit=100):
                 except requests.RequestException as e:
                     errors += 1
                     log_failure(key, e)
-            progress.update(task, advance=1, ok=updated, err=errors + no_match)
+            progress.update(
+                task,
+                advance=1,
+                ok=updated,
+                err=errors + no_match,
+                current=truncate_title(title),
+            )
 
     console.print()
     success(
@@ -1529,6 +1548,11 @@ def cmd_populate_all(ol):
         warn("Cancelled.")
         return
 
+    # Snapshot stats before so we can show a delta panel at the end.
+    # _compute_startup_stats handles failures internally (returns "?").
+    before = _compute_startup_stats()
+    started = time.monotonic()
+
     cmd_add_books(ol, count=100, source="production")
     cmd_populate_subjects(ol)
     cmd_generate_lists(ol, count=5, username=DEFAULT_USERNAME)
@@ -1537,9 +1561,11 @@ def cmd_populate_all(ol):
     cmd_seed_series(ol, count=3)
 
     console.print()
-    header("All Done!")
-    plain("Your local DB is now populated with rich test data.")
-    plain("Run 'Stats' to see the current state.")
+    with spinner("Tallying the changes…"):
+        after = _compute_startup_stats()
+    console.print(
+        summary_panel("All done!", before, after, elapsed=time.monotonic() - started)
+    )
 
 
 # ---------------------------------------------------------------------------
